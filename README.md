@@ -193,5 +193,4 @@ The engine implements its full intended pipeline: device layer, render graph, ge
 Explicitly out of scope for the core engine: physics, audio, input handling, a WebGL fallback, a Three.js compatibility layer, and a visual editor. Some may arrive as external modules. A glTF mesh loader and PBR materials are natural next additions on top of the current foundation.
 
 ## License
-
-Not yet specified.
+MIT
