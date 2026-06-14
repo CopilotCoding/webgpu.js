@@ -1,20 +1,26 @@
-// WGSL for the SceneRenderer's GPU-driven batches. Each batch draws many
-// objects of one pipeline configuration via MultiDrawSystem: the vertex shader
-// recovers its object id from the draw-slot group (slotToObject[slotIndex]),
-// then indexes per-object world matrices + material params from storage.
+// WGSL for the SceneRenderer's GPU-driven batches. The vertex shader recovers
+// its object id, then indexes per-object world matrices + material params.
 //
-// group(0): camera (binding 0), lights (1), fog (2)
-// group(1): worldMatrices (0), materialParams (1)   [per batch]
-// group(2): slotToObject (0), slotIndex dynamic uniform (1)  [MultiDrawSystem]
+// Two object-id paths (the renderer picks one at pipeline-build time):
+//  - MULTI-DRAW: one multiDrawIndexedIndirect per batch; the cull pass writes
+//    firstInstance = objectId, recovered via @builtin(instance_index). No
+//    group(2).
+//  - LOOP fallback (no multi-draw feature): one drawIndexedIndirect per slot
+//    with a per-draw dynamic uniform offset; objectId = slotToObject[slotIndex]
+//    at group(2).
+//
+// group(0): camera (0), lights (1), fog (2)
+// group(1): worldMatrices (0), materialParams (1)
+// group(2) (loop mode only): slotToObject (0), slotIndex dynamic uniform (1)
 
-const common = /* wgsl */ `
+const commonHead = /* wgsl */ `
 struct Camera {
   viewMatrix: mat4x4f,
   projectionMatrix: mat4x4f,
   frustumPlanes: array<vec4f, 6>,
   viewport: vec4f,
 };
-struct Light { posDir: vec4f, color: vec4f, };  // posDir.w: 0=dir,1=point
+struct Light { posDir: vec4f, color: vec4f, };  // posDir.w: 0=dir,1=point,2=point-no-falloff
 struct Lights {
   ambient: vec4f,                  // rgb + count
   lights: array<Light, 4>,
@@ -27,8 +33,6 @@ struct MaterialParams { color: vec4f, };           // rgb + opacity
 @group(0) @binding(2) var<uniform> fog: Fog;
 @group(1) @binding(0) var<storage, read> worldMatrices: array<mat4x4f>;
 @group(1) @binding(1) var<storage, read> materials: array<MaterialParams>;
-@group(2) @binding(0) var<storage, read> slotToObject: array<u32>;
-@group(2) @binding(1) var<uniform> slotIndex: u32;
 
 fn applyFog(rgb: vec3f, viewDepth: f32) -> vec3f {
   if (fog.colorEnabled.w < 0.5) { return rgb; }
@@ -37,9 +41,33 @@ fn applyFog(rgb: vec3f, viewDepth: f32) -> vec3f {
 }
 `;
 
+// Loop-mode-only bindings (group 2).
+const loopBindings = /* wgsl */ `
+@group(2) @binding(0) var<storage, read> slotToObject: array<u32>;
+@group(2) @binding(1) var<uniform> slotIndex: u32;
+`;
+
+// Returns the WGSL fragment that yields the object id, plus the extra vertex
+// param list, for the chosen mode.
+function objIdParts(multiDraw) {
+  if (multiDraw) {
+    return { extraParam: '@builtin(instance_index) instanceIndex: u32', objExpr: 'instanceIndex', bindings: '' };
+  }
+  return { extraParam: '', objExpr: 'slotToObject[slotIndex]', bindings: loopBindings };
+}
+
+// Wraps a color expression in fog, or returns it raw when fog is disabled for
+// this material (e.g. the sun, which must not fade into the fog/background).
+function fogWrap(fogEnabled, colorExpr, depthExpr) {
+  return fogEnabled ? `applyFog(${colorExpr}, ${depthExpr})` : colorExpr;
+}
+
 // Lit (Lambert) batch.
-export const lambertShader = /* wgsl */ `
-${common}
+export function lambertShader(multiDraw, fogEnabled = true) {
+  const { extraParam, objExpr, bindings } = objIdParts(multiDraw);
+  return /* wgsl */ `
+${commonHead}
+${bindings}
 struct VOut {
   @builtin(position) position: vec4f,
   @location(0) worldPos: vec3f,
@@ -48,8 +76,8 @@ struct VOut {
   @location(3) @interpolate(flat) obj: u32,
 };
 @vertex
-fn vertexMain(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) uv: vec2f) -> VOut {
-  let obj = slotToObject[slotIndex];
+fn vertexMain(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) uv: vec2f${extraParam ? ', ' + extraParam : ''}) -> VOut {
+  let obj = ${objExpr};
   let m = worldMatrices[obj];
   let world = m * vec4f(p, 1.0);
   let view = camera.viewMatrix * world;
@@ -82,22 +110,26 @@ fn fragmentMain(i: VOut) -> @location(0) vec4f {
     diffuse = diffuse + L.color.rgb * (L.color.w * max(dot(nrm, dir), 0.0) * atten);
   }
   let mat = materials[i.obj];
-  return vec4f(applyFog(mat.color.rgb * diffuse, i.viewDepth), mat.color.a);
+  return vec4f(${fogWrap(fogEnabled, 'mat.color.rgb * diffuse', 'i.viewDepth')}, mat.color.a);
 }
 `;
+}
 
 // Unlit (Basic) batch — solid/opacity, optional fog. Blend state is set on the
 // pipeline (normal vs additive), not in the shader.
-export const basicShader = /* wgsl */ `
-${common}
+export function basicShader(multiDraw, fogEnabled = true) {
+  const { extraParam, objExpr, bindings } = objIdParts(multiDraw);
+  return /* wgsl */ `
+${commonHead}
+${bindings}
 struct VOut {
   @builtin(position) position: vec4f,
   @location(0) viewDepth: f32,
   @location(1) @interpolate(flat) obj: u32,
 };
 @vertex
-fn vertexMain(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) uv: vec2f) -> VOut {
-  let obj = slotToObject[slotIndex];
+fn vertexMain(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) uv: vec2f${extraParam ? ', ' + extraParam : ''}) -> VOut {
+  let obj = ${objExpr};
   let m = worldMatrices[obj];
   let world = m * vec4f(p, 1.0);
   let view = camera.viewMatrix * world;
@@ -110,9 +142,10 @@ fn vertexMain(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) uv: vec
 @fragment
 fn fragmentMain(i: VOut) -> @location(0) vec4f {
   let mat = materials[i.obj];
-  return vec4f(applyFog(mat.color.rgb, i.viewDepth), mat.color.a);
+  return vec4f(${fogWrap(fogEnabled, 'mat.color.rgb', 'i.viewDepth')}, mat.color.a);
 }
 `;
+}
 
 // Points: GPU-expanded camera-facing quads (no gl_PointSize).
 // group(0) binding 0 camera; group(1) binding 0 positions storage, 1 params.

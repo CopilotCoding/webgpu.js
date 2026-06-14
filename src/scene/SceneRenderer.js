@@ -57,6 +57,8 @@ export class SceneRenderer {
     });
 
     this._batches = new Map();   // key -> Batch
+    this._mergeBatches = new Map(); // ShaderMaterial -> ShaderMergeBatch
+    this._seenMerge = new Set();
     // (custom ShaderMaterial pipelines are cached on each material instance)
     this._points = new Map();    // mesh.id -> points GPU state
     this._registered = new WeakSet();
@@ -92,10 +94,11 @@ export class SceneRenderer {
   // --- batch management ---
 
   _batchKey(mat) {
-    if (mat.kind === 'lambert') return 'lambert';
+    const fog = mat.fog === false ? 0 : 1;
+    if (mat.kind === 'lambert') return `lambert:f${fog}`;
     if (mat.kind === 'basic') {
       const blend = mat.blending === 'additive' ? 'add' : (mat.transparent ? 'alpha' : 'opaque');
-      return `basic:${blend}:dw${mat.depthWrite ? 1 : 0}:dt${mat.depthTest ? 1 : 0}:s${mat.side}:w${mat.wireframe ? 1 : 0}`;
+      return `basic:${blend}:dw${mat.depthWrite ? 1 : 0}:dt${mat.depthTest ? 1 : 0}:s${mat.side}:w${mat.wireframe ? 1 : 0}:f${fog}`;
     }
     return null;
   }
@@ -106,6 +109,12 @@ export class SceneRenderer {
     const batch = new Batch(this, mat, key);
     this._batches.set(key, batch);
     return batch;
+  }
+
+  _getMergeBatch(material) {
+    let mb = this._mergeBatches.get(material);
+    if (!mb) { mb = new ShaderMergeBatch(this, material); this._mergeBatches.set(material, mb); }
+    return mb;
   }
 
   // Releases all GPU resources created on this renderer's device (each game
@@ -130,40 +139,63 @@ export class SceneRenderer {
     this._uploadLights(scene);
     this._uploadFog(scene);
 
-    // Reset frame bookkeeping, then collect drawables.
-    this._seen.clear();
-    const shaderMeshes = [];
-    const pointsMeshes = [];
-    scene.traverse((node) => {
-      if (!node.geometry || !node.material || node.visible === false) return;
-      // visibility also respects ancestors:
-      if (!this._ancestorsVisible(node)) return;
-      if ((node.layers & layerMask) === 0) return;
-      const kind = node.material.kind;
-      if (kind === 'shader') { shaderMeshes.push(node); return; }
-      if (kind === 'points') { pointsMeshes.push(node); return; }
-      const batch = this._getBatch(node.material);
-      batch.sync(node);
-      this._seen.add(node.id);
-    });
+    // Sync the scene → GPU buffers ONCE per frame (not per camera). A frame is
+    // identified by opts.frame; if two render() calls share it (main + minimap),
+    // the second reuses the already-synced state. If no frame id is given, every
+    // call syncs (safe default).
+    const frame = opts.frame;
+    const alreadySynced = frame !== undefined && frame === this._syncedFrame;
+    let shaderMeshes = this._shaderMeshes;
+    let pointsMeshes = this._pointsMeshes;
 
-    // GC meshes that disappeared from the graph.
-    for (const batch of this._batches.values()) batch.gc(this._seen);
+    if (!alreadySynced) {
+      this._seen.clear();
+      shaderMeshes = []; pointsMeshes = [];
+      this._seenMerge.clear();
+      scene.traverse((node) => {
+        if (!node.geometry || !node.material || node.visible === false) return;
+        if (!this._ancestorsVisible(node)) return;
+        const kind = node.material.kind;
+        if (kind === 'shader') {
+          if (node.material.merge) {
+            // Merge-batched custom shader (e.g. terrain): packed into one buffer.
+            const mb = this._getMergeBatch(node.material);
+            mb.sync(node);
+            this._seenMerge.add(node.id);
+          } else {
+            shaderMeshes.push(node); // per-mesh custom shader
+          }
+          return;
+        }
+        if (kind === 'points') { pointsMeshes.push(node); return; }
+        // NOTE: no layerMask gate here — layer filtering happens per-camera in
+        // the GPU cull pass, so the shared sync covers all cameras' objects.
+        const batch = this._getBatch(node.material);
+        batch.sync(node);
+        this._seen.add(node.id);
+      });
+      for (const batch of this._batches.values()) { batch.gc(this._seen); batch.syncRecords(); }
+      for (const mb of this._mergeBatches.values()) mb.gc(this._seenMerge);
+      this._shaderMeshes = shaderMeshes;
+      this._pointsMeshes = pointsMeshes;
+      this._syncedFrame = frame;
+    }
 
-    // Update camera layer mask on each batch's cull system + counts.
-    for (const batch of this._batches.values()) batch.finalize(camera, layerMask);
+    // Per-camera cull setup (object count + this camera's layer mask).
+    for (const batch of this._batches.values()) batch.cullFor(camera, layerMask);
 
     const graph = new RenderGraph(this.device);
     graph.setCanvasTarget(this.context);
 
-    // Cull passes (compute) for each batch.
+    // Cull passes (compute) for each batch, for THIS camera.
     for (const batch of this._batches.values()) {
       if (batch.count === 0) continue;
+      const pc = batch._perCamera.get(camera);
       graph.addPass({
         name: `cull-${batch.key}`,
-        writes: [batch.multi.drawArgsBuffer, batch.multi.drawCountBuffer, batch.multi.slotToObjectBuffer],
-        reads: [camera.buffer, batch.worldBuffer, batch.boundsBuffer, batch.multi.recordBuffer],
-        execute: (encoder) => batch.multi.build(encoder),
+        writes: [pc.multi.drawArgsBuffer, pc.multi.drawCountBuffer, pc.multi.slotToObjectBuffer],
+        reads: [camera.buffer, batch.worldBuffer, batch.boundsBuffer, pc.multi.recordBuffer],
+        execute: (encoder) => pc.multi.build(encoder),
       });
     }
 
@@ -178,7 +210,8 @@ export class SceneRenderer {
     const forwardReads = [camera.buffer, this.lightsBuffer, this.fogBuffer];
     for (const batch of this._batches.values()) {
       if (batch.count === 0) continue;
-      forwardReads.push(batch.multi.drawArgsBuffer, batch.multi.slotToObjectBuffer, batch.worldBuffer, batch.materialBuffer);
+      const pc = batch._perCamera.get(camera);
+      forwardReads.push(pc.multi.drawArgsBuffer, pc.multi.slotToObjectBuffer, batch.worldBuffer, batch.materialBuffer);
     }
 
     graph.addPass({
@@ -191,7 +224,10 @@ export class SceneRenderer {
         if (opts.viewport) rp.setViewport(opts.viewport[0], opts.viewport[1], opts.viewport[2], opts.viewport[3], 0, 1);
         if (opts.scissor) rp.setScissorRect(opts.scissor[0], opts.scissor[1], opts.scissor[2], opts.scissor[3]);
 
-        // Custom-shader meshes first (typically opaque, depth-writing).
+        // Merge-batched shader meshes (terrain) — one buffer, ~1 draw call.
+        for (const mb of this._mergeBatches.values()) mb.draw(rp, camera, this._syncedFrame);
+
+        // Per-mesh custom-shader meshes.
         for (const mesh of shaderMeshes) this._drawShaderMesh(rp, mesh, camera);
 
         // Opaque batches, then transparent (additive/alpha) batches.
@@ -292,11 +328,15 @@ export class SceneRenderer {
   _drawShaderMesh(rp, mesh, camera) {
     const material = mesh.material;
     const p = this._ensureShaderPipeline(material, mesh.geometry);
-    const r = mesh._render || (mesh._render = {});
-    if (!r.cameraBG) {
-      r.cameraBG = this.device.device.createBindGroup({
+    const r = mesh._render || (mesh._render = { cameraBGs: new Map() });
+    if (!r.cameraBGs) r.cameraBGs = new Map();
+    // Camera bind group is per-camera (so the minimap uses its own matrices).
+    let cameraBG = r.cameraBGs.get(camera);
+    if (!cameraBG) {
+      cameraBG = this.device.device.createBindGroup({
         layout: p.cameraBGL, entries: [{ binding: 0, resource: { buffer: camera.buffer.gpuBuffer } }],
       });
+      r.cameraBGs.set(camera, cameraBG);
     }
     if (!r.uBuffer && material.uniformSize > 0) {
       r.uBuffer = this.device.resources.createBuffer({ size: material.uniformSize, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -305,13 +345,15 @@ export class SceneRenderer {
         layout: p.uBGL, entries: [{ binding: 0, resource: { buffer: r.uBuffer.gpuBuffer } }],
       });
     }
-    if (r.uBuffer && material.updateUniforms) {
+    // Uniforms are camera-independent — upload once per frame, not per camera.
+    if (r.uBuffer && material.updateUniforms && r._uFrame !== this._syncedFrame) {
+      r._uFrame = this._syncedFrame;
       material.updateUniforms(r.uView);
       this.device.queue.writeBuffer(r.uBuffer.gpuBuffer, 0, r.uView);
     }
 
     rp.setPipeline(p.pipeline);
-    rp.setBindGroup(0, r.cameraBG);
+    rp.setBindGroup(0, cameraBG);
     if (r.uBG) rp.setBindGroup(1, r.uBG);
     const g = mesh.geometry;
     material.attributes.forEach((name, loc) => rp.setVertexBuffer(loc, g.attributes[name].buffer.gpuBuffer));
@@ -323,13 +365,23 @@ export class SceneRenderer {
   _drawPoints(rp, mesh, camera) {
     let s = this._points.get(mesh.id);
     if (!s) { s = this._buildPoints(mesh, camera); this._points.set(mesh.id, s); }
-    // Update NDC half-size from the material's pixel size each frame.
-    const sizePx = mesh.material.size;
-    const ndcX = sizePx / this.canvas.width, ndcY = sizePx / this.canvas.height;
-    this.device.queue.writeBuffer(s.paramsBuffer.gpuBuffer, 0, new Float32Array([
-      mesh.material.color.r, mesh.material.color.g, mesh.material.color.b, 0,
-      ndcX, ndcY, 0, 0,
-    ]));
+    // Per-camera bind group (minimap uses its own matrices).
+    let cameraBG = s.cameraBGs.get(camera);
+    if (!cameraBG) {
+      cameraBG = this.device.device.createBindGroup({ layout: this._pointsPipeline.cameraBGL, entries: [{ binding: 0, resource: { buffer: camera.buffer.gpuBuffer } }] });
+      s.cameraBGs.set(camera, cameraBG);
+    }
+    // Update NDC half-size from the material's pixel size (once per frame).
+    if (s._frame !== this._syncedFrame) {
+      s._frame = this._syncedFrame;
+      const sizePx = mesh.material.size;
+      const ndcX = sizePx / this.canvas.width, ndcY = sizePx / this.canvas.height;
+      this.device.queue.writeBuffer(s.paramsBuffer.gpuBuffer, 0, new Float32Array([
+        mesh.material.color.r, mesh.material.color.g, mesh.material.color.b, 0,
+        ndcX, ndcY, 0, 0,
+      ]));
+    }
+    s.cameraBG = cameraBG;
     rp.setPipeline(s.pipeline);
     rp.setBindGroup(0, s.cameraBG);
     rp.setBindGroup(1, s.bindGroup);
@@ -366,7 +418,6 @@ export class SceneRenderer {
     const positionsBuffer = device.resources.createBuffer({ size: posData.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(positionsBuffer.gpuBuffer, 0, posData);
     const paramsBuffer = device.resources.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    const cameraBG = device.device.createBindGroup({ layout: pp.cameraBGL, entries: [{ binding: 0, resource: { buffer: camera.buffer.gpuBuffer } }] });
     const bindGroup = device.device.createBindGroup({
       layout: pp.dataBGL,
       entries: [
@@ -374,9 +425,182 @@ export class SceneRenderer {
         { binding: 1, resource: { buffer: paramsBuffer.gpuBuffer } },
       ],
     });
-    return { pipeline: pp.pipeline, cameraBG, bindGroup, positionsBuffer, paramsBuffer, count };
+    return { pipeline: pp.pipeline, cameraBGs: new Map(), bindGroup, positionsBuffer, paramsBuffer, count };
   }
 }
+
+// A merged batch for a `merge: true` ShaderMaterial: many static, identity-
+// transform meshes (e.g. terrain chunks) packed into ONE non-indexed vertex
+// buffer and drawn in as few draw() calls as possible (one per contiguous live
+// span — usually 1). No per-object transform, no culling, no indirect: the
+// vertices are world-space and the shader reads only the material's shared
+// uniform. This turns thousands of chunk draws into ~1.
+class ShaderMergeBatch {
+  constructor(renderer, material) {
+    this.renderer = renderer;
+    this.device = renderer.device;
+    this.material = material;
+    this.floatsPerVertex = material.attributes.reduce((s, n) => s + ATTR_FLOATS[n], 0);
+    this.stride = this.floatsPerVertex * 4;
+
+    // A list of fixed-size pages instead of one giant buffer: WebGPU caps a
+    // single buffer at maxBufferSize (often 256MB). Terrain across thousands of
+    // chunks can exceed that, so we page it. Each page is drawn with one draw()
+    // per contiguous live span (≈ a handful of calls total).
+    const maxBuf = (this.device.device.limits && this.device.device.limits.maxBufferSize) || (256 * 1024 * 1024);
+    this.pageVerts = Math.floor(Math.min(maxBuf, 128 * 1024 * 1024) / this.stride);
+    this.pages = []; // { buffer, head, slots:Map(id->{offset,count}), free:[], dirty:true, spanCache:[] }
+
+    this._slots = new Map();       // mesh.id -> { page, offset, count }
+
+    this.pipeline = null;
+    this.uBuffer = null;
+    this.uView = null;
+    this._cameraBGs = new Map();
+    this._uFrame = -1;
+  }
+
+  _newPage() {
+    const page = {
+      buffer: this.device.resources.createBuffer({
+        size: this.pageVerts * this.stride,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      }),
+      head: 0, slots: new Map(), free: [], dirty: true, spanCache: [],
+    };
+    this.pages.push(page);
+    return page;
+  }
+
+  _ensurePipeline() {
+    if (this.pipeline) return;
+    const device = this.device;
+    const m = this.material;
+    const module = device.device.createShaderModule({ code: m.wgsl });
+    this._cameraBGL = device.device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }] });
+    const uBGL = device.device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }] });
+    // Interleaved vertex layout from the material's attributes.
+    let offset = 0;
+    const attrs = m.attributes.map((name, loc) => {
+      const a = { format: ATTR_FORMAT[name], offset, shaderLocation: loc };
+      offset += ATTR_FLOATS[name] * 4;
+      return a;
+    });
+    const cull = m.side === 'double' ? 'none' : (m.side === 'back' ? 'front' : 'back');
+    this.pipeline = device.device.createRenderPipeline({
+      layout: device.device.createPipelineLayout({ bindGroupLayouts: [this._cameraBGL, uBGL] }),
+      vertex: { module, entryPoint: 'vertexMain', buffers: [{ arrayStride: this.stride, attributes: attrs }] },
+      fragment: { module, entryPoint: 'fragmentMain', targets: [{ format: this.renderer.format }] },
+      primitive: { topology: m.topology, cullMode: m.topology === 'triangle-list' ? cull : 'none' },
+      depthStencil: { format: 'depth24plus', depthWriteEnabled: m.depthWrite, depthCompare: m.depthCompare },
+      multisample: { count: this.renderer.sampleCount },
+    });
+    if (m.uniformSize > 0) {
+      this.uBuffer = device.resources.createBuffer({ size: m.uniformSize, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      this.uView = new Float32Array(m.uniformSize / 4);
+      this.uBG = device.device.createBindGroup({ layout: uBGL, entries: [{ binding: 0, resource: { buffer: this.uBuffer.gpuBuffer } }] });
+    }
+  }
+
+  // Interleave a mesh's named attribute arrays into this batch's vertex format.
+  _interleave(mesh) {
+    const attrs = this.material.attributes;
+    const n = mesh.geometry.attributes[attrs[0]].data.length / ATTR_FLOATS[attrs[0]];
+    const out = new Float32Array(n * this.floatsPerVertex);
+    let base = 0;
+    for (let v = 0; v < n; v++) {
+      let o = base;
+      for (const name of attrs) {
+        const fpv = ATTR_FLOATS[name];
+        const src = mesh.geometry.attributes[name].data;
+        for (let k = 0; k < fpv; k++) out[o++] = src[v * fpv + k];
+      }
+      base += this.floatsPerVertex;
+    }
+    return { data: out, count: n };
+  }
+
+  sync(mesh) {
+    if (this._slots.has(mesh.id)) return;
+    const { data, count } = this._interleave(mesh);
+    if (count > this.pageVerts) { console.warn('ShaderMergeBatch: mesh exceeds page size'); return; }
+
+    // Find a page with a fitting free span or tail room; else open a new page.
+    let chosen = null, offset = -1;
+    for (const page of this.pages) {
+      for (let i = 0; i < page.free.length; i++) {
+        if (page.free[i].count >= count) {
+          offset = page.free[i].offset;
+          if (page.free[i].count === count) page.free.splice(i, 1);
+          else { page.free[i].offset += count; page.free[i].count -= count; }
+          chosen = page; break;
+        }
+      }
+      if (chosen) break;
+      if (page.head + count <= this.pageVerts) { chosen = page; offset = page.head; page.head += count; break; }
+    }
+    if (!chosen) { chosen = this._newPage(); offset = chosen.head; chosen.head += count; }
+
+    this.device.queue.writeBuffer(chosen.buffer.gpuBuffer, offset * this.stride, data);
+    chosen.slots.set(mesh.id, { offset, count });
+    chosen.dirty = true;
+    this._slots.set(mesh.id, { page: chosen, offset, count });
+  }
+
+  gc(seenIds) {
+    for (const [id, rec] of [...this._slots]) {
+      if (!seenIds.has(id)) {
+        rec.page.free.push({ offset: rec.offset, count: rec.count });
+        rec.page.slots.delete(id);
+        rec.page.dirty = true;
+        this._slots.delete(id);
+      }
+    }
+  }
+
+  // Contiguous live vertex spans within a page (merging adjacent allocations).
+  _pageSpans(page) {
+    if (!page.dirty) return page.spanCache;
+    const live = [...page.slots.values()].sort((a, b) => a.offset - b.offset);
+    const spans = [];
+    for (const s of live) {
+      const last = spans[spans.length - 1];
+      if (last && last.offset + last.count === s.offset) last.count += s.count;
+      else spans.push({ offset: s.offset, count: s.count });
+    }
+    page.spanCache = spans;
+    page.dirty = false;
+    return spans;
+  }
+
+  draw(rp, camera, syncedFrame) {
+    this._ensurePipeline();
+    if (this._slots.size === 0) return;
+    let camBG = this._cameraBGs.get(camera);
+    if (!camBG) {
+      camBG = this.device.device.createBindGroup({ layout: this._cameraBGL, entries: [{ binding: 0, resource: { buffer: camera.buffer.gpuBuffer } }] });
+      this._cameraBGs.set(camera, camBG);
+    }
+    if (this.uBuffer && this.material.updateUniforms && this._uFrame !== syncedFrame) {
+      this._uFrame = syncedFrame;
+      this.material.updateUniforms(this.uView);
+      this.device.queue.writeBuffer(this.uBuffer.gpuBuffer, 0, this.uView);
+    }
+    rp.setPipeline(this.pipeline);
+    rp.setBindGroup(0, camBG);
+    if (this.uBG) rp.setBindGroup(1, this.uBG);
+    for (const page of this.pages) {
+      const spans = this._pageSpans(page);
+      if (spans.length === 0) continue;
+      rp.setVertexBuffer(0, page.buffer.gpuBuffer);
+      for (const s of spans) rp.draw(s.count, 1, s.offset);
+    }
+  }
+}
+
+// Floats + WGSL vertex format per named attribute, for merge-batch interleaving.
+const ATTR_FLOATS = { position: 3, normal: 3, uv: 2, color: 3, skyAccess: 1 };
+const ATTR_FORMAT = { position: 'float32x3', normal: 'float32x3', uv: 'float32x2', color: 'float32x3', skyAccess: 'float32' };
 
 // One pipeline-group's worth of objects: arena + per-object storage + cull.
 class Batch {
@@ -392,21 +616,46 @@ class Batch {
     this.materialBuffer = this.device.resources.createBuffer({ size: OBJ_CAP * MATERIAL_STRIDE, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     this.boundsBuffer = this.device.resources.createBuffer({ size: OBJ_CAP * 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
 
-    this._slots = new Map();    // mesh.id -> { slot, alloc }
+    this._slots = new Map();    // mesh.id -> { slot, alloc, world(Float32Array cache), matKey }
     this._freeSlots = [];
     this._nextSlot = 0;
 
-    this.multi = null;          // built lazily once camera is known
+    // Per-camera GPU state: each camera gets its own MultiDrawSystem (cull +
+    // indirect args) and scene bind group, but they SHARE this batch's record /
+    // world / material / bounds buffers — so a second view (e.g. the minimap)
+    // culls the same objects from its own viewpoint. The pipeline + objectBG
+    // are camera-independent and built once.
+    this._perCamera = new Map();
     this.pipeline = null;
+    this.objectBG = null;
     this._sampleMaterial = sampleMaterial;
+    this.count = 0;
   }
 
-  _ensureGPU(camera) {
-    if (this.multi) return;
-    this.multi = new MultiDrawSystem(this.device, camera, this.worldBuffer, this.boundsBuffer, OBJ_CAP);
-    this.pipeline = this._buildPipeline();
+  // Returns (creating if needed) the per-camera cull system + scene bind group.
+  _forCamera(camera) {
+    let pc = this._perCamera.get(camera);
+    if (pc) return pc;
 
-    this.sceneBG = this.device.device.createBindGroup({
+    // The first camera's MultiDrawSystem owns the record buffer; later cameras
+    // share it (and the draw-slot layout) so they cull the same scene.
+    const first = this._perCamera.values().next().value;
+    const multi = new MultiDrawSystem(this.device, camera, this.worldBuffer, this.boundsBuffer, OBJ_CAP,
+      first ? { recordBuffer: first.multi.recordBuffer, drawSlotBindGroupLayout: first.multi.drawSlotBindGroupLayout } : {});
+
+    if (!this.pipeline) {
+      this._multiForLayout = multi; // pipeline layout needs a drawSlotBindGroupLayout
+      this.pipeline = this._buildPipeline();
+      this.objectBG = this.device.device.createBindGroup({
+        layout: this.renderer.objectBGL,
+        entries: [
+          { binding: 0, resource: { buffer: this.worldBuffer.gpuBuffer } },
+          { binding: 1, resource: { buffer: this.materialBuffer.gpuBuffer } },
+        ],
+      });
+    }
+
+    const sceneBG = this.device.device.createBindGroup({
       layout: this.renderer.sceneBGL,
       entries: [
         { binding: 0, resource: { buffer: camera.buffer.gpuBuffer } },
@@ -414,20 +663,25 @@ class Batch {
         { binding: 2, resource: { buffer: this.renderer.fogBuffer.gpuBuffer } },
       ],
     });
-    this.objectBG = this.device.device.createBindGroup({
-      layout: this.renderer.objectBGL,
-      entries: [
-        { binding: 0, resource: { buffer: this.worldBuffer.gpuBuffer } },
-        { binding: 1, resource: { buffer: this.materialBuffer.gpuBuffer } },
-      ],
-    });
+    pc = { multi, sceneBG };
+    this._perCamera.set(camera, pc);
+    return pc;
   }
 
   _buildPipeline() {
     const device = this.device;
     const mat = this._sampleMaterial;
     const isLambert = mat.kind === 'lambert';
-    const module = device.device.createShaderModule({ code: isLambert ? lambertShader : basicShader });
+    // Object id comes from firstInstance (instance_index) whenever the device
+    // supports it (multi-draw OR indirect-first-instance) — no group(2). Only
+    // the last-resort path needs the slotToObject draw-slot group.
+    const byFirstInstance = this._multiForLayout.firstInstanceId;
+    const fogEnabled = mat.fog !== false;
+    const code = (isLambert ? lambertShader : basicShader)(byFirstInstance, fogEnabled);
+    const module = device.device.createShaderModule({ code });
+    const bindGroupLayouts = byFirstInstance
+      ? [this.renderer.sceneBGL, this.renderer.objectBGL]
+      : [this.renderer.sceneBGL, this.renderer.objectBGL, this._multiForLayout.drawSlotBindGroupLayout];
 
     let blend = undefined;
     if (mat.kind === 'basic' && mat.blending === 'additive') {
@@ -441,9 +695,7 @@ class Batch {
     const topology = (mat.kind === 'basic' && mat.wireframe) ? 'line-list' : 'triangle-list';
 
     return device.device.createRenderPipeline({
-      layout: device.device.createPipelineLayout({
-        bindGroupLayouts: [this.renderer.sceneBGL, this.renderer.objectBGL, this.multi.drawSlotBindGroupLayout],
-      }),
+      layout: device.device.createPipelineLayout({ bindGroupLayouts }),
       vertex: { module, entryPoint: 'vertexMain', buffers: this.arena.vertexBufferLayouts },
       fragment: { module, entryPoint: 'fragmentMain', targets: [{ format: this.renderer.format, blend }] },
       primitive: { topology, cullMode: topology === 'line-list' ? 'none' : cull },
@@ -452,7 +704,13 @@ class Batch {
     });
   }
 
-  /** Registers a new mesh or refreshes an existing one's transform + material. */
+  /**
+   * Registers a new mesh, or refreshes an existing one's transform/material
+   * only when it actually changed. Called ONCE per frame per mesh (not per
+   * camera) — the GPU buffers are shared across cameras. Avoiding the
+   * unconditional per-frame upload is what keeps CPU cost low for the static
+   * bulk (e.g. terrain chunks that never move after meshing).
+   */
   sync(mesh) {
     let entry = this._slots.get(mesh.id);
     if (!entry) {
@@ -463,24 +721,34 @@ class Batch {
         uvs: mesh.geometry.attributes.uv ? mesh.geometry.attributes.uv.data : null,
       });
       const alloc = this.arena.allocate(vertexData, indexData);
-      entry = { slot, alloc };
+      entry = { slot, alloc, world: new Float32Array(16), matKey: '', layers: -1, frustumCulled: null };
       this._slots.set(mesh.id, entry);
-      // Local AABB.
       const b = computeBounds(mesh.geometry.attributes.position.data);
       this.device.queue.writeBuffer(this.boundsBuffer.gpuBuffer, slot * 32, new Float32Array([...b.min, 0, ...b.max, 0]));
       this._recordDirty = true;
-      entry._needRecord = true;
     }
-    // World matrix (refresh every frame — cheap, and the game animates them).
+
+    // World matrix — recompute, compare, upload only if changed.
     mesh.updateWorldMatrix(mesh.parent ? mesh.parent.worldMatrix : null);
-    this.device.queue.writeBuffer(this.worldBuffer.gpuBuffer, entry.slot * 64, mesh.worldMatrix);
-    // Material color + opacity.
-    const c = mesh.material.color;
-    this.device.queue.writeBuffer(this.materialBuffer.gpuBuffer, entry.slot * MATERIAL_STRIDE,
-      new Float32Array([c.r, c.g, c.b, mesh.material.opacity ?? 1]));
-    entry._mesh = mesh;
-    entry._frustumCulled = mesh.frustumCulled;
-    entry._layers = mesh.layers;
+    const wm = mesh.worldMatrix, cache = entry.world;
+    let changed = false;
+    for (let i = 0; i < 16; i++) { if (cache[i] !== wm[i]) { changed = true; break; } }
+    if (changed) { cache.set(wm); this.device.queue.writeBuffer(this.worldBuffer.gpuBuffer, entry.slot * 64, cache); }
+
+    // Material color + opacity — upload only when changed.
+    const c = mesh.material.color, op = mesh.material.opacity ?? 1;
+    const matKey = `${c.r},${c.g},${c.b},${op}`;
+    if (matKey !== entry.matKey) {
+      entry.matKey = matKey;
+      this.device.queue.writeBuffer(this.materialBuffer.gpuBuffer, entry.slot * MATERIAL_STRIDE, new Float32Array([c.r, c.g, c.b, op]));
+    }
+
+    // Record-affecting flags — mark records dirty only on actual change.
+    if (mesh.layers !== entry.layers || mesh.frustumCulled !== entry.frustumCulled) {
+      entry.layers = mesh.layers;
+      entry.frustumCulled = mesh.frustumCulled;
+      this._recordDirty = true;
+    }
   }
 
   gc(seenIds) {
@@ -494,44 +762,48 @@ class Batch {
     }
   }
 
-  finalize(camera, layerMask) {
-    this._ensureGPU(camera);
-    this.multi.setCameraLayerMask(layerMask);
-
-    // The cull shader writes slotToObject[outSlot] = recordIndex, and the
-    // vertex shader uses that recordIndex to index BOTH worldMatrices and
-    // materials. So record index must equal the slot we wrote world/material/
-    // bounds at — we keep them identical (record index == entry.slot) rather
-    // than compacting, and size the cull dispatch to cover all live slots.
-    // Freed slots left with indexCount 0 in their record draw nothing.
-    if (this._recordDirty) {
-      // Clear records for any freed slots so stale geometry isn't drawn.
-      for (const slot of this._freeSlots) {
-        this.multi.setRecord(slot, { firstIndex: 0, indexCount: 0, baseVertex: 0, transformIndex: slot, layerMask: 0, flags: 0 });
-      }
-      for (const entry of this._slots.values()) {
-        this.multi.setRecord(entry.slot, {
-          firstIndex: entry.alloc.firstIndex,
-          indexCount: entry.alloc.indexCount,
-          baseVertex: entry.alloc.baseVertex,
-          transformIndex: entry.slot,
-          layerMask: entry._layers ?? 0x1,
-          flags: entry._frustumCulled === false ? 1 : 0,
-        });
-      }
-      this._recordDirty = false;
+  // Writes the shared draw-records (once per frame, only if membership/flags
+  // changed). Record index == slot == index into world/material/bounds, since
+  // the cull shader's slotToObject maps a draw slot to that record index, which
+  // the vertex shader uses to fetch world + material.
+  syncRecords() {
+    if (!this._recordDirty) { this.count = this._nextSlot; return; }
+    const owner = this._perCamera.values().next().value;
+    if (!owner) return; // no camera yet
+    const m = owner.multi;
+    for (const slot of this._freeSlots) {
+      m.setRecord(slot, { firstIndex: 0, indexCount: 0, baseVertex: 0, transformIndex: slot, layerMask: 0, flags: 0 });
     }
-    this.multi.setObjectCount(this._nextSlot);
+    for (const entry of this._slots.values()) {
+      m.setRecord(entry.slot, {
+        firstIndex: entry.alloc.firstIndex,
+        indexCount: entry.alloc.indexCount,
+        baseVertex: entry.alloc.baseVertex,
+        transformIndex: entry.slot,
+        layerMask: entry.layers ?? 0x1,
+        flags: entry.frustumCulled === false ? 1 : 0,
+      });
+    }
+    this._recordDirty = false;
     this.count = this._nextSlot;
+  }
+
+  // Per-camera cull setup: sets this camera's object count + layer mask.
+  cullFor(camera, layerMask) {
+    const pc = this._forCamera(camera);
+    pc.multi.setObjectCount(this._nextSlot);
+    pc.multi.setCameraLayerMask(layerMask);
+    return pc;
   }
 
   draw(rp, camera) {
     if (this.count === 0) return;
+    const pc = this._perCamera.get(camera);
     rp.setPipeline(this.pipeline);
-    rp.setBindGroup(0, this.sceneBG);
+    rp.setBindGroup(0, pc.sceneBG);
     rp.setBindGroup(1, this.objectBG);
     this.arena.bind(rp);
-    this.multi.drawAll(rp, 2);
+    pc.multi.drawAll(rp, 2);
   }
 }
 

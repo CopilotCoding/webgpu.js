@@ -119,7 +119,12 @@ fn cullAndCompact(@builtin(global_invocation_id) id: vec3u) {
   drawArgs[slot].instanceCount = 1u;
   drawArgs[slot].firstIndex = rec.firstIndex;
   drawArgs[slot].baseVertex = i32(rec.baseVertex);
-  drawArgs[slot].firstInstance = 0u; // non-zero needs indirect-first-instance; use slotToObject instead
-  slotToObject[slot] = id.x;         // VS reads this via a per-draw dynamic offset
+  // Object id is provided two ways so the renderer can pick a draw path:
+  //  - firstInstance: read via @builtin(instance_index) under
+  //    multiDrawIndexedIndirect (honors non-zero firstInstance).
+  //  - slotToObject[slot]: read via a per-draw dynamic offset in the
+  //    drawIndexedIndirect loop fallback (where firstInstance is a no-op).
+  drawArgs[slot].firstInstance = id.x;
+  slotToObject[slot] = id.x;
 }
 `;

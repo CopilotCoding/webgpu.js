@@ -50,7 +50,21 @@ export async function createDevice(options = {}) {
     throw new Error('navigator.gpu.requestAdapter() returned null — no suitable GPUAdapter is available');
   }
 
-  const device = await adapter.requestDevice(options.deviceDescriptor);
+  // Opt into the indirect-draw features the GPU-driven path benefits from, when
+  // the adapter has them:
+  //  - indirect-first-instance (standardized; Firefox + Chrome): lets indirect
+  //    draws carry a non-zero firstInstance, so the object id rides there and
+  //    the per-draw bind-group rebind is eliminated.
+  //  - chromium-experimental-multi-draw-indirect (Chromium only): collapses a
+  //    whole batch into one multi-draw call.
+  const desc = { ...(options.deviceDescriptor || {}) };
+  const optional = ['indirect-first-instance', 'chromium-experimental-multi-draw-indirect'];
+  const wanted = optional.filter((f) => adapter.features.has(f));
+  if (wanted.length) desc.requiredFeatures = [...(desc.requiredFeatures || []), ...wanted];
+
+  const device = await adapter.requestDevice(desc);
+  console.log('[webgpu.js] indirect-first-instance:', device.features.has('indirect-first-instance') ? 'on' : 'OFF',
+    '| multi-draw:', device.features.has('chromium-experimental-multi-draw-indirect') ? 'on' : 'off');
 
   return new Device(adapter, device);
 }

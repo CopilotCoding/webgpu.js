@@ -37,6 +37,16 @@ export class MultiDrawSystem {
     this.capacity = capacity;
     this.objectCount = 0;
     this.cameraLayerMask = 0xffffffff;
+    // Draw-path capability:
+    //  - multiDraw: one multiDrawIndexedIndirect per batch (Chromium only).
+    //  - firstInstanceId: object id rides in firstInstance, read via
+    //    @builtin(instance_index) — available with EITHER multi-draw or the
+    //    standard indirect-first-instance feature (Firefox + Chrome). Lets the
+    //    loop drop its per-draw bind-group rebind.
+    // Only when neither is present do we fall back to the slotToObject loop.
+    const feats = device.device.features;
+    this.multiDraw = feats.has('chromium-experimental-multi-draw-indirect');
+    this.firstInstanceId = this.multiDraw || feats.has('indirect-first-instance');
 
     this.recordBuffer = opts.recordBuffer ?? device.resources.createBuffer({
       size: capacity * RECORD_SIZE,
@@ -49,7 +59,8 @@ export class MultiDrawSystem {
     });
     this.drawCountBuffer = device.resources.createBuffer({
       size: 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+      // INDIRECT so it can serve as multiDrawIndexedIndirect's GPU draw-count.
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
     this.paramsBuffer = device.resources.createBuffer({
       size: 16, // vec4u: objectCount, layerMask, _, _
@@ -186,6 +197,25 @@ export class MultiDrawSystem {
    * uses for this system's drawSlotBindGroupLayout.
    */
   drawAll(renderPass, slotGroupIndex) {
+    if (this.multiDraw) {
+      // One call drives the whole batch; count comes from drawCountBuffer.
+      renderPass.multiDrawIndexedIndirect(
+        this.drawArgsBuffer.gpuBuffer, 0, this.objectCount,
+        this.drawCountBuffer.gpuBuffer, 0,
+      );
+      return;
+    }
+    if (this.firstInstanceId) {
+      // Cheap loop: bare indirect draws, object id via firstInstance (needs
+      // indirect-first-instance). No per-draw bind-group rebind. Empty slots
+      // have indexCount 0 and draw nothing.
+      for (let i = 0; i < this.objectCount; i++) {
+        renderPass.drawIndexedIndirect(this.drawArgsBuffer.gpuBuffer, i * DRAW_ARG_SIZE);
+      }
+      return;
+    }
+    // Last-resort loop: no first-instance support — recover the id via a
+    // per-draw dynamic uniform offset into slotToObject.
     for (let i = 0; i < this.objectCount; i++) {
       renderPass.setBindGroup(slotGroupIndex, this.drawSlotBindGroup, [i * UNIFORM_ALIGN]);
       renderPass.drawIndexedIndirect(this.drawArgsBuffer.gpuBuffer, i * DRAW_ARG_SIZE);

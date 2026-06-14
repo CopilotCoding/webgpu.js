@@ -77,6 +77,7 @@ export class ShaderMaterial {
     depthWrite = true,
     depthCompare = 'less',
     topology = 'triangle-list',
+    merge = false,
   }) {
     this.kind = 'shader';
     this.wgsl = wgsl;
@@ -88,6 +89,11 @@ export class ShaderMaterial {
     this.depthWrite = depthWrite;
     this.depthCompare = depthCompare;
     this.topology = topology;
+    // merge: every mesh sharing this material has an IDENTITY transform (its
+    // vertices are already world-space) and reads only this material's shared
+    // uniform — so the renderer packs all of them into one geometry stream and
+    // draws them in a SINGLE call. Ideal for many static chunks (terrain).
+    this.merge = merge;
     this.opacity = 1;
   }
 }

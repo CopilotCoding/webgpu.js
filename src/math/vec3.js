@@ -56,6 +56,7 @@ export class Vec3 {
   setScalar(s) { this.x = s; this.y = s; this.z = s; return this; }
   clone() { return new Vec3(this.x, this.y, this.z); }
   copy(v) { this.x = v.x; this.y = v.y; this.z = v.z; return this; }
+  fromArray(a, o = 0) { this.x = a[o]; this.y = a[o + 1]; this.z = a[o + 2]; return this; }
 
   add(v) { this.x += v.x; this.y += v.y; this.z += v.z; return this; }
   sub(v) { this.x -= v.x; this.y -= v.y; this.z -= v.z; return this; }
