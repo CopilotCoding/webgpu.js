@@ -11,6 +11,25 @@ export function perspective(fovYRadians, aspect, near, far) {
   return out;
 }
 
+/**
+ * Orthographic projection, column-major, mapping z to WebGPU's [0, 1] clip
+ * depth range (near -> 0, far -> 1) to match `perspective` above.
+ */
+export function orthographic(left, right, bottom, top, near, far) {
+  const out = new Float32Array(16);
+  const lr = 1 / (left - right);
+  const bt = 1 / (bottom - top);
+  const nf = 1 / (near - far);
+  out[0] = -2 * lr;
+  out[5] = -2 * bt;
+  out[10] = nf;
+  out[12] = (left + right) * lr;
+  out[13] = (top + bottom) * bt;
+  out[14] = near * nf;
+  out[15] = 1;
+  return out;
+}
+
 export function lookAt(eye, target, up) {
   const zAxis = normalize(subtract(eye, target));
   const xAxis = normalize(cross(up, zAxis));

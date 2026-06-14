@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>webgpu.js — Composable frame</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #error {
+      position: absolute; top: 0; left: 0; right: 0;
+      font-family: monospace; color: #fff; background: #b00020;
+      padding: 1rem; white-space: pre-wrap;
+    }
+    #legend {
+      position: absolute; bottom: 0; left: 0; right: 0;
+      font-family: monospace; color: #fff; background: rgba(0,0,0,0.5);
+      padding: 0.5rem 1rem;
+    }
+    button { font-family: monospace; margin-right: 0.5rem; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="error" hidden></div>
+  <div id="legend">
+    <button id="toggle-bloom">Toggle bloom</button>
+    <button id="resize">Resize canvas</button>
+    <button id="dispose">Dispose / recreate</button>
+    <span id="state"></span> — the post chain is composable: bloom is opt-in, and the Engine supports setSize() + dispose().
+  </div>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

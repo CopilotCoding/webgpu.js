@@ -72,6 +72,24 @@ export class CullingPass {
     });
   }
 
+  /**
+   * Rebinds the pass to a recreated Hi-Z texture (after a resize). Must be
+   * given the same camera + world buffer the pass was built with.
+   */
+  setHiZ(camera, worldBuffer, hiZBuffer) {
+    this.bindGroup = this.device.device.createBindGroup({
+      layout: this.pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: camera.buffer.gpuBuffer } },
+        { binding: 1, resource: { buffer: worldBuffer.gpuBuffer } },
+        { binding: 2, resource: { buffer: this.boundsBuffer.gpuBuffer } },
+        { binding: 3, resource: { buffer: this.visibilityBuffer.gpuBuffer } },
+        { binding: 4, resource: hiZBuffer.texture.gpuTexture.createView() },
+        { binding: 5, resource: { buffer: this.objectCountBuffer.gpuBuffer } },
+      ],
+    });
+  }
+
   /** Writes one object's local AABB into the bounds buffer at `index`. */
   setBounds(index, localBounds) {
     const data = new Float32Array(8);

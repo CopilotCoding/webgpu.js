@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>webgpu.js — Materials &amp; Blending</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #05060a; overflow: hidden; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #error {
+      position: absolute; top: 0; left: 0; right: 0;
+      font-family: monospace; color: #fff; background: #b00020;
+      padding: 1rem; white-space: pre-wrap;
+    }
+    #legend {
+      position: absolute; bottom: 0; left: 0; right: 0;
+      font-family: monospace; color: #fff; background: rgba(0,0,0,0.5);
+      padding: 0.5rem 1rem;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="error" hidden></div>
+  <div id="legend">Built-in materials: Lambert (lit), Basic additive glow, Basic alpha panel, a vertex-color custom-shader mesh, and a Points star cloud. Additive blends are order-independent.</div>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

@@ -53,11 +53,14 @@ export class Engine {
     shadowBounds = { min: [-30, -5, -30], max: [30, 30, 30] },
     lightDirection = [0.4, -0.7, 0.35],
     textureLayers = null, // array of canvas/ImageBitmap sources; defaults to a single white pixel
+    bloom = true, // opt-out of the bloom + tonemap post chain; when off the HDR scene is tonemapped straight to the canvas
   }) {
     this.device = device;
     this.canvas = canvas;
+    this.bloom = bloom;
     this.near = near;
     this.far = far;
+    this._fov = fov;
     this.shadowBounds = shadowBounds;
     this.lightDirection = lightDirection;
     this.onUpdate = null;
@@ -125,6 +128,17 @@ export class Engine {
 
     this._buildBindGroupsAndPipelines();
     this._installPicking();
+
+    // With bloom off, the bloom texture is never written each frame, so the
+    // composite would read stale/uninitialized contents — clear it once to
+    // black so "scene + bloom" reduces to just the tonemapped scene.
+    if (!this.bloom) {
+      const enc = device.device.createCommandEncoder();
+      enc.beginRenderPass({
+        colorAttachments: [{ view: this.bloomTexture.gpuTexture.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
+      }).end();
+      device.queue.submit([enc.finish()]);
+    }
 
     this._lastTime = 0;
     this._running = false;
@@ -288,38 +302,48 @@ export class Engine {
     this.blurPass = new FullscreenPass(device, { fragmentSource: blurFragmentSource, bindGroupLayoutEntries: blurLayoutEntries, targetFormat: HDR_FORMAT });
     this.compositePass = new FullscreenPass(device, { fragmentSource: compositeFragmentSource, bindGroupLayoutEntries: compositeLayoutEntries, targetFormat: this.format });
 
+    // Post param buffers don't depend on framebuffer size — create them once
+    // and keep them; only the post bind groups (which reference the HDR/bloom
+    // textures) are rebuilt on resize, in _buildPostBindGroups().
     const paramBuf = (vals) => {
       const b = device.resources.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       device.queue.writeBuffer(b.gpuBuffer, 0, new Float32Array(vals));
       return b;
     };
-    const brightParams = paramBuf([1.0, 1.0, 0, 0]);
-    const blurHParams = paramBuf([1, 0, 0, 0]);
-    const blurVParams = paramBuf([0, 1, 0, 0]);
+    this._brightParams = paramBuf([1.0, 1.0, 0, 0]);
+    this._blurHParams = paramBuf([1, 0, 0, 0]);
+    this._blurVParams = paramBuf([0, 1, 0, 0]);
 
+    this._buildPostBindGroups();
+
+    // --- Pipelines (need the shared geometry's vertex layout) ---
+    this._pipelinesBuilt = false;
+  }
+
+  // (Re)creates the post-process bind groups, which reference the HDR/bloom
+  // textures and so must be rebuilt whenever those are recreated (resize).
+  // The passes, pipelines, and param buffers are size-independent and reused.
+  _buildPostBindGroups() {
     this.brightBindGroup = this.brightPass.createBindGroup([
       { binding: 0, resource: this.hdrTexture.gpuTexture.createView() },
       { binding: 1, resource: this.linearSampler.gpuSampler },
-      { binding: 2, resource: { buffer: brightParams.gpuBuffer } },
+      { binding: 2, resource: { buffer: this._brightParams.gpuBuffer } },
     ]);
     this.blurHBindGroup = this.blurPass.createBindGroup([
       { binding: 0, resource: this.brightTexture.gpuTexture.createView() },
       { binding: 1, resource: this.linearSampler.gpuSampler },
-      { binding: 2, resource: { buffer: blurHParams.gpuBuffer } },
+      { binding: 2, resource: { buffer: this._blurHParams.gpuBuffer } },
     ]);
     this.blurVBindGroup = this.blurPass.createBindGroup([
       { binding: 0, resource: this.blurTexture.gpuTexture.createView() },
       { binding: 1, resource: this.linearSampler.gpuSampler },
-      { binding: 2, resource: { buffer: blurVParams.gpuBuffer } },
+      { binding: 2, resource: { buffer: this._blurVParams.gpuBuffer } },
     ]);
     this.compositeBindGroup = this.compositePass.createBindGroup([
       { binding: 0, resource: this.hdrTexture.gpuTexture.createView() },
       { binding: 1, resource: this.bloomTexture.gpuTexture.createView() },
       { binding: 2, resource: this.linearSampler.gpuSampler },
     ]);
-
-    // --- Pipelines (need the shared geometry's vertex layout) ---
-    this._pipelinesBuilt = false;
   }
 
   _ensurePipelines() {
@@ -427,6 +451,56 @@ export class Engine {
     this._running = false;
   }
 
+  /**
+   * Resizes the framebuffer-sized resources (depth, Hi-Z, HDR + bloom targets)
+   * and updates the camera projection/viewport and cluster projection. Rebuilds
+   * the bind groups that reference the recreated textures.
+   */
+  setSize(width, height) {
+    if (width <= 0 || height <= 0) return;
+    this.canvas.width = width;
+    this.canvas.height = height;
+
+    // Destroy the old size-dependent textures.
+    this.depthTexture.destroy();
+    this.hiZBuffer.destroy?.();
+    this.hdrTexture.destroy();
+    this.brightTexture.destroy();
+    this.blurTexture.destroy();
+    this.bloomTexture.destroy();
+
+    this.depthTexture = this.device.resources.createTexture({
+      size: [width, height], format: 'depth24plus',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.hiZBuffer = new HiZBuffer(this.device, width, height);
+    this._buildPostTargets(width, height);
+    if (!this.bloom) {
+      const enc = this.device.device.createCommandEncoder();
+      enc.beginRenderPass({ colorAttachments: [{ view: this.bloomTexture.gpuTexture.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }] }).end();
+      this.device.queue.submit([enc.finish()]);
+    }
+
+    this.projectionMatrix = perspective(this._fov, width / height, this.near, this.far);
+    this.camera.setProjectionMatrix(this.projectionMatrix);
+    this.camera.setViewport(0, 0, width, height);
+    this.clusterGrid.setProjection(this.projectionMatrix, width, height, this.near, this.far);
+
+    // Rebind only what references the recreated textures: the culling pass's
+    // Hi-Z binding and the post-process bind groups. The pipelines, passes,
+    // param buffers, and size-independent bind groups are left intact (so a
+    // resize doesn't leak a fresh set of passes/buffers each call).
+    this.cullingPass.setHiZ(this.camera, this.scene.worldMatricesBuffer, this.hiZBuffer);
+    this._buildPostBindGroups();
+  }
+
+  /** Stops the loop and releases every GPU resource this Engine created. */
+  dispose() {
+    this.stop();
+    this.onUpdate = null;
+    this.device.resources.destroyAll();
+  }
+
   renderFrame(dt) {
     if (this.onUpdate) this.onUpdate(dt);
     this.camera.update();
@@ -503,9 +577,15 @@ export class Engine {
       reads: read,
       execute: (rp) => pass.draw(rp, bg),
     });
-    fs('bright-pass', this.brightTexture, [this.hdrTexture], this.brightBindGroup, this.brightPass);
-    fs('bloom-blur-h', this.blurTexture, [this.brightTexture], this.blurHBindGroup, this.blurPass);
-    fs('bloom-blur-v', this.bloomTexture, [this.blurTexture], this.blurVBindGroup, this.blurPass);
+    // Bloom is opt-out: when off, skip the bright + separable-blur passes and
+    // composite the HDR scene against a zeroed bloom texture (tonemap only).
+    // This is the composable-frame seam — the post chain is just passes the
+    // Engine chooses to add or omit.
+    if (this.bloom) {
+      fs('bright-pass', this.brightTexture, [this.hdrTexture], this.brightBindGroup, this.brightPass);
+      fs('bloom-blur-h', this.blurTexture, [this.brightTexture], this.blurHBindGroup, this.blurPass);
+      fs('bloom-blur-v', this.bloomTexture, [this.blurTexture], this.blurVBindGroup, this.blurPass);
+    }
     fs('composite', CANVAS, [this.hdrTexture, this.bloomTexture], this.compositeBindGroup, this.compositePass);
 
     graph.execute();

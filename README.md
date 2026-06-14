@@ -59,8 +59,22 @@ The examples are numbered to mirror how the engine was built, each one self-cont
 | 14 | gpu-driven | The whole scene consolidated into one indirect draw |
 | 15 | picking | GPU raycasting against object bounds |
 | 16 | **engine** | The high-level Engine layer — the whole scene in ~55 lines |
+| 17 | primitives | Cylinder/cone/sphere/octahedron/dodecahedron/tube generators + computed normals |
+| 18 | materials-blend | Built-in Basic/Lambert/Points materials, additive + alpha blending, a custom-shader vertex-color mesh |
+| 19 | multi-geometry | GPU-driven rendering of *heterogeneous* geometry: a GeometryArena + compute-built indexed multi-draw |
+| 20 | ortho-and-layers | Orthographic camera + a layer mask evaluated in the GPU cull pass (a minimap inset) |
+| 21 | composable-frame | The Engine's frame as composable passes: bloom opt-in, plus `setSize()` / `dispose()` |
 
-Start with **16-engine** to see the assembly layer, then read **01** through **15** to see what it's made of.
+Start with **16-engine** to see the assembly layer, then read **01** through **15** to see what it's made of. Examples **17–21** add the capabilities needed to render a heterogeneous, game-like scene (many distinct meshes, custom shaders, transparency, an ortho minimap) while staying GPU-driven.
+
+### How 17–21 extend the engine
+
+Earlier examples assume one shared geometry, one fixed shader, and a single indirect draw. **17–21** lift those limits so the GPU-driven path can render a real game's mix of meshes and materials:
+
+- **17–18** add the missing content tools: more primitives + `computeVertexNormals`, and Three-style `BasicMaterial`/`LambertMaterial`/`PointsMaterial` plus blend-state plumbing on `Material`.
+- **19** is the core generalization: a `GeometryArena` packs many *different* meshes into shared buffers, and `MultiDrawSystem` runs a compute pass that frustum-culls per object and compacts a per-object `DrawIndexedIndirect` arg array — so heterogeneous geometry draws GPU-driven, at constant CPU submit cost.
+- **20** adds an orthographic camera wrapper and a per-object layer mask the cull pass honors (the minimap pattern), so a second view culls on the GPU too.
+- **21** makes the Engine's frame composable (bloom is opt-in) and adds `setSize()`/`dispose()` for real app lifecycles.
 
 ---
 
@@ -194,4 +208,4 @@ Explicitly out of scope for the core engine: physics, audio, input handling, a W
 
 ## License
 
-Not yet specified.
+MIT
