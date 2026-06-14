@@ -48,6 +48,10 @@ export function setLength(a, len) {
 export class Vec3 {
   constructor(x = 0, y = 0, z = 0) { this.x = x; this.y = y; this.z = z; }
 
+  // Lets duck-typed code distinguish a vector from a plain [x,y,z] array
+  // (mirrors THREE.Vector3.isVector3, which some game code checks).
+  get isVector3() { return true; }
+
   set(x, y, z) { this.x = x; this.y = y; this.z = z; return this; }
   setScalar(s) { this.x = s; this.y = s; this.z = s; return this; }
   clone() { return new Vec3(this.x, this.y, this.z); }

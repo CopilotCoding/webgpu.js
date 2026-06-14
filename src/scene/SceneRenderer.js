@@ -108,6 +108,13 @@ export class SceneRenderer {
     return batch;
   }
 
+  // Releases all GPU resources created on this renderer's device (each game
+  // session creates a fresh device, so this frees the whole session's
+  // resources). After dispose() the renderer must not be used again.
+  dispose() {
+    this.device.destroyAll();
+  }
+
   // --- per-frame ---
 
   /**
@@ -225,7 +232,11 @@ export class SceneRenderer {
     lights.forEach((L, i) => {
       const off = 4 + i * 8;
       const n = L.n;
-      if (L.point) { data[off] = n.position.x; data[off + 1] = n.position.y; data[off + 2] = n.position.z; data[off + 3] = 1; }
+      if (L.point) {
+        data[off] = n.position.x; data[off + 1] = n.position.y; data[off + 2] = n.position.z;
+        // w: 1 = quadratic distance falloff, 2 = no falloff (decay 0).
+        data[off + 3] = n.decay === 0 ? 2 : 1;
+      }
       else { const d = n.direction || n.position; data[off] = d.x; data[off + 1] = d.y; data[off + 2] = d.z; data[off + 3] = 0; }
       data[off + 4] = n.color.r; data[off + 5] = n.color.g; data[off + 6] = n.color.b; data[off + 7] = n.intensity;
     });

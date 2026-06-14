@@ -42,8 +42,11 @@ export class OrthographicCamera {
   lookAt(target) { this.target = target; return this; }
 
   update() {
-    this.camera.setViewMatrix(lookAt(this.position, this.target, this.up));
+    this.camera.setViewMatrix(lookAt(arr(this.position), arr(this.target), arr(this.up)));
     this.camera.update();
     return this;
   }
 }
+
+// Accepts a [x,y,z] array or a {x,y,z} vector (e.g. Vec3).
+function arr(v) { return Array.isArray(v) ? v : [v.x, v.y, v.z]; }
