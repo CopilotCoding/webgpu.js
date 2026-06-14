@@ -131,6 +131,9 @@ export class RenderGraph {
       if (pass.colorAttachments || pass.depthStencilAttachment) {
         const colorAttachments = (pass.colorAttachments ?? []).map((attachment) => ({
           view: this._resolveView(attachment.target),
+          // Optional MSAA resolve target (e.g. a multisampled color texture
+          // resolving into the canvas).
+          ...(attachment.resolveTarget ? { resolveTarget: this._resolveView(attachment.resolveTarget) } : {}),
           clearValue: attachment.clearValue,
           loadOp: attachment.loadOp ?? 'load',
           storeOp: attachment.storeOp ?? 'store',

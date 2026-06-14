@@ -64,6 +64,7 @@ The examples are numbered to mirror how the engine was built, each one self-cont
 | 19 | multi-geometry | GPU-driven rendering of *heterogeneous* geometry: a GeometryArena + compute-built indexed multi-draw |
 | 20 | ortho-and-layers | Orthographic camera + a layer mask evaluated in the GPU cull pass (a minimap inset) |
 | 21 | composable-frame | The Engine's frame as composable passes: bloom opt-in, plus `setSize()` / `dispose()` |
+| 22 | scene-layer | Retained-mode scene graph (Mesh/Group/lights/materials) drawn GPU-driven by SceneRenderer: Lambert + additive + custom-shader + points |
 
 Start with **16-engine** to see the assembly layer, then read **01** through **15** to see what it's made of. Examples **17–21** add the capabilities needed to render a heterogeneous, game-like scene (many distinct meshes, custom shaders, transparency, an ortho minimap) while staying GPU-driven.
 

@@ -89,3 +89,40 @@ function normalize(q) {
   const len = Math.hypot(q[0], q[1], q[2], q[3]) || 1;
   return [q[0] / len, q[1] / len, q[2] / len, q[3] / len];
 }
+
+// --- Chainable mutable quaternion class ---
+//
+// Object form ({x,y,z,w}) of the helpers above, for scene/game orientation
+// math. Mutating methods return `this`. Vec3 args accept any {x,y,z}.
+export class Quat {
+  constructor(x = 0, y = 0, z = 0, w = 1) { this.x = x; this.y = y; this.z = z; this.w = w; }
+
+  set(x, y, z, w) { this.x = x; this.y = y; this.z = z; this.w = w; return this; }
+  clone() { return new Quat(this.x, this.y, this.z, this.w); }
+  copy(q) { this.x = q.x; this.y = q.y; this.z = q.z; this.w = q.w; return this; }
+  identity() { this.x = 0; this.y = 0; this.z = 0; this.w = 1; return this; }
+
+  setFromAxisAngle(axis, angle) {
+    const [x, y, z, w] = fromAxisAngle([axis.x, axis.y, axis.z], angle);
+    return this.set(x, y, z, w);
+  }
+
+  setFromUnitVectors(from, to) {
+    const [x, y, z, w] = fromUnitVectors([from.x, from.y, from.z], [to.x, to.y, to.z]);
+    return this.set(x, y, z, w);
+  }
+
+  /** this = this * q (Hamilton product), in place. */
+  multiply(q) {
+    const [x, y, z, w] = multiply([this.x, this.y, this.z, this.w], [q.x, q.y, q.z, q.w]);
+    return this.set(x, y, z, w);
+  }
+
+  /** this = a * b */
+  multiplyQuaternions(a, b) {
+    const [x, y, z, w] = multiply([a.x, a.y, a.z, a.w], [b.x, b.y, b.z, b.w]);
+    return this.set(x, y, z, w);
+  }
+
+  toArray() { return [this.x, this.y, this.z, this.w]; }
+}
