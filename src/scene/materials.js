@@ -49,20 +49,45 @@ export class PointsMaterial {
   }
 }
 
-// Custom-shader material (the terrain). Carries WGSL source + a uniforms object
-// the renderer uploads. `uniforms` is { name: { value } } like a typical
-// shader-material, packed in declaration order into one uniform buffer by the
-// renderer's terrain pipeline (see SceneRenderer). vertexAttributes lists the
-// per-vertex attributes the geometry must provide beyond position
-// (e.g. ['color','skyAccess']).
+// Custom-shader material: an app brings its own WGSL and the renderer builds a
+// dedicated pipeline for it, drawing each mesh that uses it per-mesh, with the
+// camera at group(0) binding(0) and a single app-controlled uniform buffer at
+// group(1) binding(0).
+//
+// This is a fully GENERAL custom-shader material — the engine has no knowledge
+// of what the shader does. The app supplies:
+//   - wgsl: shader source with `vertexMain`/`fragmentMain`. Camera is at
+//     @group(0) @binding(0); the uniform block at @group(1) @binding(0).
+//   - attributes: ordered list of the geometry attribute names to bind as
+//     vertex buffers, each at the matching shaderLocation (e.g.
+//     ['position','normal','color']). Their formats come from the
+//     Geometry.
+//   - uniformSize: byte size of the group(1) uniform buffer.
+//   - updateUniforms(view): called each frame; write your bytes into the given
+//     Float32Array view of the uniform buffer.
+//   - cull/depthWrite/depthCompare/topology: pipeline state.
 export class ShaderMaterial {
-  constructor({ uniforms = {}, wgsl = null, vertexAttributes = [], side = 'front', transparent = false }) {
+  constructor({
+    wgsl,
+    attributes = ['position', 'normal', 'uv'],
+    uniformSize = 0,
+    updateUniforms = null,
+    side = 'front',
+    transparent = false,
+    depthWrite = true,
+    depthCompare = 'less',
+    topology = 'triangle-list',
+  }) {
     this.kind = 'shader';
-    this.uniforms = uniforms;
     this.wgsl = wgsl;
-    this.vertexAttributes = vertexAttributes;
+    this.attributes = attributes;
+    this.uniformSize = uniformSize;
+    this.updateUniforms = updateUniforms;
     this.side = side;
     this.transparent = transparent;
+    this.depthWrite = depthWrite;
+    this.depthCompare = depthCompare;
+    this.topology = topology;
     this.opacity = 1;
   }
 }

@@ -69,11 +69,15 @@ fn fragmentMain(i: VOut) -> @location(0) vec4f {
   for (var k = 0u; k < count; k = k + 1u) {
     let L = lighting.lights[k];
     var dir: vec3f; var atten = 1.0;
-    if (L.posDir.w < 0.5) { dir = normalize(L.posDir.xyz); }
-    else {
+    if (L.posDir.w < 0.5) {
+      // Directional light.
+      dir = normalize(L.posDir.xyz);
+    } else {
+      // Point light. posDir.w == 2 flags a no-falloff point light (decay 0);
+      // == 1 uses quadratic distance attenuation.
       let d = L.posDir.xyz - i.worldPos; let dist = length(d);
       dir = d / max(dist, 0.0001);
-      atten = 1.0 / (1.0 + 0.09 * dist + 0.032 * dist * dist);
+      if (L.posDir.w < 1.5) { atten = 1.0 / (1.0 + 0.09 * dist + 0.032 * dist * dist); }
     }
     diffuse = diffuse + L.color.rgb * (L.color.w * max(dot(nrm, dir), 0.0) * atten);
   }
@@ -110,89 +114,7 @@ fn fragmentMain(i: VOut) -> @location(0) vec4f {
 }
 `;
 
-// Terrain shader — a direct WGSL port of the game's marching-cubes terrain
-// GLSL (per-vertex color + skyAccess; sun gated by sky access and a hemisphere
-// day/night term; lantern with quadratic falloff). Identity model matrix:
-// terrain verts are already world-space. Custom uniforms in one block.
-//
-// group(0) binding 0: camera. group(1) binding 0: TerrainUniforms.
-export const terrainShader = /* wgsl */ `
-struct Camera {
-  viewMatrix: mat4x4f,
-  projectionMatrix: mat4x4f,
-  frustumPlanes: array<vec4f, 6>,
-  viewport: vec4f,
-};
-struct TerrainU {
-  sunPosition: vec4f,      // xyz + sunIntensity in w
-  lanternPosition: vec4f,  // xyz + lanternIntensity in w
-  params: vec4f,           // lanternRange, ambientIntensity, fogNear, fogFar
-  fogColor: vec4f,         // rgb + fogEnabled
-};
-@group(0) @binding(0) var<uniform> camera: Camera;
-@group(1) @binding(0) var<uniform> u: TerrainU;
-
-struct VOut {
-  @builtin(position) position: vec4f,
-  @location(0) color: vec3f,
-  @location(1) normal: vec3f,
-  @location(2) worldPos: vec3f,
-  @location(3) skyAccess: f32,
-  @location(4) viewDepth: f32,
-};
-
-@vertex
-fn vertexMain(
-  @location(0) position: vec3f,
-  @location(1) normal: vec3f,
-  @location(2) color: vec3f,
-  @location(3) skyAccess: f32,
-) -> VOut {
-  var o: VOut;
-  o.color = color;
-  o.skyAccess = skyAccess;
-  o.normal = normalize(normal);
-  o.worldPos = position;
-  let view = camera.viewMatrix * vec4f(position, 1.0);
-  o.position = camera.projectionMatrix * view;
-  o.viewDepth = -view.z;
-  return o;
-}
-
-@fragment
-fn fragmentMain(i: VOut) -> @location(0) vec4f {
-  let n = normalize(i.normal);
-  let sunIntensity = u.sunPosition.w;
-  let lanternIntensity = u.lanternPosition.w;
-  let lanternRange = u.params.x;
-  let ambientIntensity = u.params.y;
-
-  let sunDir = normalize(u.sunPosition.xyz - i.worldPos);
-  let sunDot = max(0.0, dot(n, sunDir));
-  let hemisphereDot = pow(max(0.0, dot(normalize(i.worldPos), sunDir)), 0.35);
-  let sunContribI = sunDot * hemisphereDot * sunIntensity * i.skyAccess;
-  let sunContrib = sunContribI * vec3f(1.0, 0.97, 0.88);
-
-  let lDir = u.lanternPosition.xyz - i.worldPos;
-  let lDist = length(lDir);
-  let lDot = max(0.0, dot(n, normalize(lDir)));
-  let lScaled = lDist / lanternRange;
-  let lAtten = lanternIntensity / (1.0 + lScaled * lScaled * 0.18);
-  let lFill = lAtten * 0.45;
-  let lanternContrib = (lDot * lAtten + lFill) * vec3f(1.0, 0.80, 0.47);
-
-  let light = vec3f(ambientIntensity) + sunContrib + lanternContrib;
-  var rgb = i.color * light;
-
-  if (u.fogColor.w > 0.5) {
-    let f = clamp((i.viewDepth - u.params.z) / max(u.params.w - u.params.z, 0.0001), 0.0, 1.0);
-    rgb = mix(rgb, u.fogColor.rgb, f);
-  }
-  return vec4f(rgb, 1.0);
-}
-`;
-
-// Points (star field): GPU-expanded camera-facing quads (no gl_PointSize).
+// Points: GPU-expanded camera-facing quads (no gl_PointSize).
 // group(0) binding 0 camera; group(1) binding 0 positions storage, 1 params.
 export const pointsShader = /* wgsl */ `
 struct Camera {

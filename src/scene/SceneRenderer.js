@@ -1,10 +1,16 @@
 import { RenderGraph, CANVAS } from '../render-graph/RenderGraph.js';
 import { GeometryArena, interleaveStandard } from '../geometry/GeometryArena.js';
 import { MultiDrawSystem } from '../culling/MultiDrawSystem.js';
-import { lambertShader, basicShader, terrainShader, pointsShader } from './sceneShaders.wgsl.js';
+import { lambertShader, basicShader, pointsShader } from './sceneShaders.wgsl.js';
 
 const OBJ_CAP = 2048;          // per-batch object capacity
 const MATERIAL_STRIDE = 16;    // vec4 color (rgb + opacity)
+
+// Byte size per GPUVertexFormat, for building custom-shader vertex layouts.
+const VERTEX_FORMAT_BYTES = {
+  float32: 4, float32x2: 8, float32x3: 12, float32x4: 16,
+  uint32: 4, sint32: 4,
+};
 
 // SceneRenderer: draws a retained Scene graph through the GPU-driven path.
 //
@@ -13,7 +19,7 @@ const MATERIAL_STRIDE = 16;    // vec4 color (rgb + opacity)
 // (all its meshes' geometry packed into shared buffers), per-object world-matrix
 // + material storage buffers, an AABB buffer, and a MultiDrawSystem that
 // frustum-culls on the GPU and emits a compacted indexed-indirect arg array.
-// Terrain (custom ShaderMaterial) and Points draw via their own pipelines.
+// Custom ShaderMaterial meshes and Points draw via their own pipelines.
 //
 // A mesh is registered into its batch on first sight (geometry uploaded into the
 // arena, a draw-record + bounds written); subsequent frames just refresh its
@@ -51,7 +57,7 @@ export class SceneRenderer {
     });
 
     this._batches = new Map();   // key -> Batch
-    this._terrain = null;        // lazily-built terrain pipeline state
+    // (custom ShaderMaterial pipelines are cached on each material instance)
     this._points = new Map();    // mesh.id -> points GPU state
     this._registered = new WeakSet();
     this._seen = new Set();      // mesh ids seen this frame (for removal GC)
@@ -119,7 +125,7 @@ export class SceneRenderer {
 
     // Reset frame bookkeeping, then collect drawables.
     this._seen.clear();
-    const terrainMeshes = [];
+    const shaderMeshes = [];
     const pointsMeshes = [];
     scene.traverse((node) => {
       if (!node.geometry || !node.material || node.visible === false) return;
@@ -127,7 +133,7 @@ export class SceneRenderer {
       if (!this._ancestorsVisible(node)) return;
       if ((node.layers & layerMask) === 0) return;
       const kind = node.material.kind;
-      if (kind === 'shader') { terrainMeshes.push(node); return; }
+      if (kind === 'shader') { shaderMeshes.push(node); return; }
       if (kind === 'points') { pointsMeshes.push(node); return; }
       const batch = this._getBatch(node.material);
       batch.sync(node);
@@ -154,7 +160,7 @@ export class SceneRenderer {
       });
     }
 
-    // Single forward pass: terrain, opaque batches, then transparent batches, then points.
+    // Single forward pass: shader-meshes, opaque batches, transparent batches, points.
     const msaa = this.sampleCount > 1;
     const colorAttachment = msaa
       ? { target: this.msaaColor, resolveTarget: CANVAS, clearValue: this._clearColor(scene), loadOp: opts.clear === false ? 'load' : 'clear', storeOp: 'store' }
@@ -178,8 +184,8 @@ export class SceneRenderer {
         if (opts.viewport) rp.setViewport(opts.viewport[0], opts.viewport[1], opts.viewport[2], opts.viewport[3], 0, 1);
         if (opts.scissor) rp.setScissorRect(opts.scissor[0], opts.scissor[1], opts.scissor[2], opts.scissor[3]);
 
-        // Terrain first (opaque, depth-writing).
-        for (const mesh of terrainMeshes) this._drawTerrain(rp, mesh, camera);
+        // Custom-shader meshes first (typically opaque, depth-writing).
+        for (const mesh of shaderMeshes) this._drawShaderMesh(rp, mesh, camera);
 
         // Opaque batches, then transparent (additive/alpha) batches.
         const batches = [...this._batches.values()].filter(b => b.count > 0);
@@ -234,80 +240,71 @@ export class SceneRenderer {
     this.device.queue.writeBuffer(this.fogBuffer.gpuBuffer, 0, data);
   }
 
-  // --- terrain (custom shader, per-mesh) ---
+  // --- custom ShaderMaterial (per-mesh, app-supplied WGSL) ---
+  //
+  // The engine builds a pipeline from the material's own WGSL + declared
+  // vertex attributes, with camera at group(0) and one app-controlled uniform
+  // buffer at group(1). It has no knowledge of what the shader computes — the
+  // app fills the uniform bytes via material.updateUniforms(view).
 
-  _ensureTerrainPipeline(mesh) {
-    if (this._terrain) return this._terrain;
+  _ensureShaderPipeline(material, geometry) {
+    // One pipeline per material instance (cached on the material).
+    if (material._pipeline) return material._pipeline;
     const device = this.device;
-    const module = device.device.createShaderModule({ code: terrainShader });
+    const module = device.device.createShaderModule({ code: material.wgsl });
     const cameraBGL = device.device.createBindGroupLayout({
-      entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } }],
+      entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }],
     });
     const uBGL = device.device.createBindGroupLayout({
-      entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }],
+      entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }],
     });
-    // Vertex layout: position(0) f32x3, normal(1) f32x3, color(2) f32x3, skyAccess(3) f32
-    const buffers = [
-      { arrayStride: 12, attributes: [{ format: 'float32x3', offset: 0, shaderLocation: 0 }] },
-      { arrayStride: 12, attributes: [{ format: 'float32x3', offset: 0, shaderLocation: 1 }] },
-      { arrayStride: 12, attributes: [{ format: 'float32x3', offset: 0, shaderLocation: 2 }] },
-      { arrayStride: 4, attributes: [{ format: 'float32', offset: 0, shaderLocation: 3 }] },
-    ];
+    // Build vertex buffer layouts from the geometry's named attributes, in the
+    // material's declared order; shaderLocation == declaration index.
+    const buffers = material.attributes.map((name, loc) => {
+      const attr = geometry.attributes[name];
+      if (!attr) throw new Error(`ShaderMaterial: geometry missing attribute "${name}"`);
+      return { arrayStride: VERTEX_FORMAT_BYTES[attr.format], attributes: [{ format: attr.format, offset: 0, shaderLocation: loc }] };
+    });
+    const cull = material.side === 'double' ? 'none' : (material.side === 'back' ? 'front' : 'back');
     const pipeline = device.device.createRenderPipeline({
       layout: device.device.createPipelineLayout({ bindGroupLayouts: [cameraBGL, uBGL] }),
       vertex: { module, entryPoint: 'vertexMain', buffers },
       fragment: { module, entryPoint: 'fragmentMain', targets: [{ format: this.format }] },
-      primitive: { topology: 'triangle-list', cullMode: 'back' },
-      depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+      primitive: { topology: material.topology, cullMode: material.topology === 'triangle-list' ? cull : 'none' },
+      depthStencil: { format: 'depth24plus', depthWriteEnabled: material.depthWrite, depthCompare: material.depthCompare },
       multisample: { count: this.sampleCount },
     });
-    this._terrain = { pipeline, cameraBGL, uBGL };
-    return this._terrain;
+    material._pipeline = { pipeline, cameraBGL, uBGL };
+    return material._pipeline;
   }
 
-  _drawTerrain(rp, mesh, camera) {
-    const t = this._ensureTerrainPipeline(mesh);
+  _drawShaderMesh(rp, mesh, camera) {
+    const material = mesh.material;
+    const p = this._ensureShaderPipeline(material, mesh.geometry);
     const r = mesh._render || (mesh._render = {});
     if (!r.cameraBG) {
       r.cameraBG = this.device.device.createBindGroup({
-        layout: t.cameraBGL, entries: [{ binding: 0, resource: { buffer: camera.buffer.gpuBuffer } }],
+        layout: p.cameraBGL, entries: [{ binding: 0, resource: { buffer: camera.buffer.gpuBuffer } }],
       });
     }
-    // Terrain uniform buffer (one per terrain mesh; shared values, but each
-    // mesh binds it — cheap). Created/refreshed from material.uniforms.
-    if (!r.uBuffer) {
-      r.uBuffer = this.device.resources.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    if (!r.uBuffer && material.uniformSize > 0) {
+      r.uBuffer = this.device.resources.createBuffer({ size: material.uniformSize, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      r.uView = new Float32Array(material.uniformSize / 4);
       r.uBG = this.device.device.createBindGroup({
-        layout: t.uBGL, entries: [{ binding: 0, resource: { buffer: r.uBuffer.gpuBuffer } }],
+        layout: p.uBGL, entries: [{ binding: 0, resource: { buffer: r.uBuffer.gpuBuffer } }],
       });
     }
-    this._writeTerrainUniforms(r.uBuffer, mesh.material.uniforms);
+    if (r.uBuffer && material.updateUniforms) {
+      material.updateUniforms(r.uView);
+      this.device.queue.writeBuffer(r.uBuffer.gpuBuffer, 0, r.uView);
+    }
 
-    rp.setPipeline(t.pipeline);
+    rp.setPipeline(p.pipeline);
     rp.setBindGroup(0, r.cameraBG);
-    rp.setBindGroup(1, r.uBG);
+    if (r.uBG) rp.setBindGroup(1, r.uBG);
     const g = mesh.geometry;
-    rp.setVertexBuffer(0, g.attributes.position.buffer.gpuBuffer);
-    rp.setVertexBuffer(1, g.attributes.normal.buffer.gpuBuffer);
-    rp.setVertexBuffer(2, g.attributes.color.buffer.gpuBuffer);
-    rp.setVertexBuffer(3, g.attributes.skyAccess.buffer.gpuBuffer);
+    material.attributes.forEach((name, loc) => rp.setVertexBuffer(loc, g.attributes[name].buffer.gpuBuffer));
     rp.draw(g.vertexCount);
-  }
-
-  _writeTerrainUniforms(buffer, u) {
-    // Packs TerrainU: sunPosition.xyz+sunIntensity, lanternPosition.xyz+lanternIntensity,
-    // params(lanternRange, ambientIntensity, fogNear, fogFar), fogColor.rgb+enabled.
-    const g = (n, d) => (u[n] ? u[n].value : d);
-    const sp = g('sunPosition', { x: 0, y: 1, z: 0 });
-    const lp = g('lanternPosition', { x: 0, y: 0, z: 0 });
-    const fog = u.fog ? u.fog.value : null;
-    const data = new Float32Array([
-      sp.x, sp.y, sp.z, g('sunIntensity', 1),
-      lp.x, lp.y, lp.z, g('lanternIntensity', 0),
-      g('lanternRange', 1), g('ambientIntensity', 0.03), fog ? fog.near : 0, fog ? fog.far : 1,
-      fog ? fog.color.r : 0, fog ? fog.color.g : 0, fog ? fog.color.b : 0, fog ? 1 : 0,
-    ]);
-    this.device.queue.writeBuffer(buffer.gpuBuffer, 0, data);
   }
 
   // --- points ---

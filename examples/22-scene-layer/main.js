@@ -59,17 +59,17 @@ try {
     scene.add(g); glows.push(g);
   }
 
-  // --- Custom-shader "terrain" quad (per-vertex color + skyAccess) ---
+  // --- Custom-shader floor quad (per-vertex color) ---
   // Centered under the building grid (which sits around z = -10), sized to
   // cover it, and just below the building bases.
   const N = 20, size = 26, cz = -10, y = -1.5;
-  const pos = [], col = [], sky = [];
+  const pos = [], col = [];
   for (let z = 0; z < N; z++) for (let x = 0; x < N; x++) {
     const x0 = (x / N - 0.5) * size, x1 = ((x + 1) / N - 0.5) * size;
     const z0 = (z / N - 0.5) * size + cz, z1 = ((z + 1) / N - 0.5) * size + cz;
     // CCW from above so the +Y top face is the front face (cullMode 'back').
     const quad = [[x0, y, z0], [x1, y, z1], [x1, y, z0], [x0, y, z0], [x0, y, z1], [x1, y, z1]];
-    for (const p of quad) { pos.push(...p); const c = 0.3 + 0.4 * ((x + z) % 2); col.push(c, c * 0.8, c * 0.5); sky.push(1); }
+    for (const p of quad) { pos.push(...p); const c = 0.3 + 0.4 * ((x + z) % 2); col.push(c, c * 0.8, c * 0.5); }
   }
   const positions = new Float32Array(pos);
   const terrainGeo = new Geometry(device, {
@@ -77,19 +77,41 @@ try {
       position: { format: 'float32x3', data: positions },
       normal: { format: 'float32x3', data: computeVertexNormals(positions) },
       color: { format: 'float32x3', data: new Float32Array(col) },
-      skyAccess: { format: 'float32', data: new Float32Array(sky) },
     },
   });
+  // A generic custom-shader material: the app brings its own WGSL + a uniform
+  // buffer it fills each frame. Here, a simple animated "pulse" light over a
+  // moving point, using the geometry's per-vertex color. (This demonstrates the
+  // engine's ShaderMaterial path — the engine knows nothing about what it does.)
+  const customWGSL = /* wgsl */ `
+struct Camera { viewMatrix: mat4x4f, projectionMatrix: mat4x4f, frustumPlanes: array<vec4f,6>, viewport: vec4f, };
+struct U { lightPos: vec4f, fogColor: vec4f, fogRange: vec4f, };
+@group(0) @binding(0) var<uniform> camera: Camera;
+@group(1) @binding(0) var<uniform> u: U;
+struct VOut { @builtin(position) position: vec4f, @location(0) color: vec3f, @location(1) world: vec3f, @location(2) viewDepth: f32, };
+@vertex fn vertexMain(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) color: vec3f) -> VOut {
+  var o: VOut; o.color = color; o.world = p;
+  let view = camera.viewMatrix * vec4f(p, 1.0);
+  o.position = camera.projectionMatrix * view; o.viewDepth = -view.z;
+  return o;
+}
+@fragment fn fragmentMain(i: VOut) -> @location(0) vec4f {
+  let d = length(u.lightPos.xyz - i.world);
+  let glow = u.lightPos.w / (1.0 + d * d * 0.2);
+  var rgb = i.color * (0.15 + glow);
+  let f = clamp((i.viewDepth - u.fogRange.x) / max(u.fogRange.y - u.fogRange.x, 0.0001), 0.0, 1.0);
+  rgb = mix(rgb, u.fogColor.rgb, f);
+  return vec4f(rgb, 1.0);
+}`;
+  const lightPos = new Vec3(0, 0, -10);
   const terrainMat = new ShaderMaterial({
-    vertexAttributes: ['color', 'skyAccess'],
-    uniforms: {
-      sunPosition: { value: new Vec3(20, 30, 20) },
-      sunIntensity: { value: 1.2 },
-      lanternPosition: { value: new Vec3(0, 0, -10) },
-      lanternIntensity: { value: 2.0 },
-      lanternRange: { value: 1.0 },
-      ambientIntensity: { value: 0.05 },
-      fog: { value: { color: scene.fog.color, near: scene.fog.near, far: scene.fog.far } },
+    wgsl: customWGSL,
+    attributes: ['position', 'normal', 'color'],
+    uniformSize: 48, // 3 x vec4
+    updateUniforms: (v) => {
+      v[0] = lightPos.x; v[1] = lightPos.y; v[2] = lightPos.z; v[3] = 2.5; // light + intensity
+      v[4] = scene.fog.color.r; v[5] = scene.fog.color.g; v[6] = scene.fog.color.b; v[7] = 0;
+      v[8] = scene.fog.near; v[9] = scene.fog.far;
     },
   });
   scene.add(new Mesh(terrainGeo, terrainMat));
@@ -114,8 +136,8 @@ try {
 
     const t = performance.now() * 0.001;
     glows.forEach((g, i) => g.position.set(Math.sin(t + i * 2) * 5, 1 + i, Math.cos(t + i * 2) * 5 - 10));
-    // animate the lantern in the terrain shader
-    terrainMat.uniforms.lanternPosition.value.set(Math.sin(t) * 6, 0, Math.cos(t) * 6 - 10);
+    // Move the custom shader's light (read in updateUniforms each frame).
+    lightPos.set(Math.sin(t) * 6, 0, Math.cos(t) * 6 - 10);
 
     renderer.render(scene, camera);
     requestAnimationFrame(frame);
