@@ -66,16 +66,17 @@ The examples are numbered to mirror how the engine was built, each one self-cont
 | 21 | composable-frame | The Engine's frame as composable passes: bloom opt-in, plus `setSize()` / `dispose()` |
 | 22 | scene-layer | Retained-mode scene graph (Mesh/Group/lights/materials) drawn GPU-driven by SceneRenderer: Lambert + additive + custom-shader + points |
 
-Start with **16-engine** to see the assembly layer, then read **01** through **15** to see what it's made of. Examples **17–21** add the capabilities needed to render a heterogeneous, game-like scene (many distinct meshes, custom shaders, transparency, an ortho minimap) while staying GPU-driven.
+Start with **16-engine** to see the assembly layer, then read **01** through **15** to see what it's made of. Examples **17–22** add the capabilities needed to render a heterogeneous, game-like scene (many distinct meshes, custom shaders, transparency, an ortho minimap, a retained scene graph) while staying GPU-driven.
 
-### How 17–21 extend the engine
+### How 17–22 extend the engine
 
-Earlier examples assume one shared geometry, one fixed shader, and a single indirect draw. **17–21** lift those limits so the GPU-driven path can render a real game's mix of meshes and materials:
+Earlier examples assume one shared geometry, one fixed shader, and a single indirect draw. **17–22** lift those limits so the GPU-driven path can render a real game's mix of meshes and materials:
 
 - **17–18** add the missing content tools: more primitives + `computeVertexNormals`, and Three-style `BasicMaterial`/`LambertMaterial`/`PointsMaterial` plus blend-state plumbing on `Material`.
 - **19** is the core generalization: a `GeometryArena` packs many *different* meshes into shared buffers, and `MultiDrawSystem` runs a compute pass that frustum-culls per object and compacts a per-object `DrawIndexedIndirect` arg array — so heterogeneous geometry draws GPU-driven, at constant CPU submit cost.
 - **20** adds an orthographic camera wrapper and a per-object layer mask the cull pass honors (the minimap pattern), so a second view culls on the GPU too.
 - **21** makes the Engine's frame composable (bloom is opt-in) and adds `setSize()`/`dispose()` for real app lifecycles.
+- **22** is the **retained-mode scene layer** (`src/scene/`): imperative `Mesh`/`Group`/`Scene` nodes a game mutates in place (`mesh.position.copy(...)`, `material.color.setHex(...)`, `group.add(...)`), plus `Vec3`/`Quat`/`Color` classes and lights/fog. A `SceneRenderer` walks the graph and draws it through the GPU-driven path — batching meshes by pipeline (each batch its own `GeometryArena` + `MultiDrawSystem` with GPU cull), with dedicated pipelines for a custom-shader material and points. This is the layer a Three.js-style app ports onto.
 
 ---
 
@@ -171,16 +172,19 @@ import { FlyControls }   from './src/controls/FlyControls.js';
 The engine is a set of composable systems with narrow interfaces. Nothing is load-bearing by accident; the renderer does not depend on the scene graph, the scene graph does not depend on materials, and each system can be used on its own.
 
 - **Device layer** (`src/device/`) — owns the WebGPU adapter, device, and queue. All GPU object creation flows through the `ResourceManager` (`src/resources/`); nothing else touches the raw WebGPU API for resource creation. Resources are immutable once created and carry an explicit `destroy()`.
-- **Render graph** (`src/render-graph/`) — passes declare their resource reads, writes, and attachments. The graph topologically orders them and resolves attachment views; pass order comes from dependency, not call order.
-- **Geometry** (`src/geometry/`) — immutable vertex/index buffers described by a layout that maps directly to WebGPU vertex buffer layouts. `primitives.js` provides `boxGeometry`/`boxData`.
-- **Materials** (`src/materials/`) — a material is a pipeline descriptor plus typed bindings; pipelines are compiled once and cached by descriptor hash.
-- **Scene graph** (`src/scene/`) — dirty-flagged hierarchy; a compute pass propagates world transforms one depth level at a time.
-- **Culling** (`src/culling/`) — frustum culling against the camera planes and occlusion culling against a hierarchical depth (Hi-Z) buffer from the previous frame, both in compute, writing a visibility buffer that feeds indirect draw generation.
-- **Lighting** (`src/lighting/`) — clustered lighting: the view frustum is subdivided into a 3D grid of clusters and a compute pass assigns lights to clusters each frame. Plus a directional shadow map with PCF.
+- **Math** (`src/math/`) — column-major `mat4` (perspective/orthographic/lookAt/TRS/invert), plus chainable `Vec3`/`Quat` classes and a `Color` for CPU-side scene and game math. The mat4/array helpers stay allocation-light for the hot paths; the classes are the ergonomic surface for app code.
+- **Render graph** (`src/render-graph/`) — passes declare their resource reads, writes, and attachments. The graph topologically orders them, resolves attachment views (including optional MSAA `resolveTarget`s), and inserts barriers; pass order comes from dependency, not call order.
+- **Geometry** (`src/geometry/`) — immutable vertex/index buffers described by a layout that maps directly to WebGPU vertex buffer layouts. `primitives.js` provides box/cylinder/cone/sphere/octahedron/dodecahedron/tube generators plus `computeVertexNormals`. `GeometryArena` packs many distinct meshes (one vertex layout) into shared buffers so heterogeneous geometry can be drawn together.
+- **Materials** (`src/materials/`) — a `Material` is a pipeline descriptor plus typed bindings; pipelines are compiled once and cached by descriptor hash. Built-in factories (`BasicMaterial`/`LambertMaterial`/`PointsMaterial`) cover the common unlit/diffuse/points cases with blend, depth, side, and fog options.
+- **Camera** (`src/camera/`) — the GPU camera uniform (view/projection/frustum planes/viewport), plus `PerspectiveCamera`/`OrthographicCamera` wrappers (position/target/up/layers) that mirror a conventional camera API.
+- **Scene graph (GPU-driven)** (`src/scene/`) — `SceneNode` hierarchy whose world transforms are propagated by a compute pass (`TransformPropagation`), one depth level at a time.
+- **Scene layer (retained-mode)** (`src/scene/`) — `Node`/`Mesh`/`Group`/`Scene` an app mutates imperatively, with `Color`, lights, fog, and material descriptors. `SceneRenderer` draws the graph through the GPU-driven path: meshes are batched by pipeline (each batch its own `GeometryArena` + `MultiDrawSystem` + GPU cull), with dedicated pipelines for custom-shader materials and points.
+- **Culling** (`src/culling/`) — frustum culling against the camera planes and occlusion culling against a hierarchical depth (Hi-Z) buffer from the previous frame, both in compute. `IndirectDrawSystem` compacts a single instanced draw; `MultiDrawSystem` compacts a per-object `DrawIndexedIndirect` arg array for heterogeneous geometry, honoring a per-object layer mask and frustum-cull-disable flag.
+- **Lighting** (`src/lighting/`) — clustered lighting: the view frustum is subdivided into a 3D grid of clusters and a compute pass assigns lights to clusters each frame. Plus a directional shadow map with PCF. (Both optional — the retained scene layer uses a small forward lights block instead.)
 - **Textures** (`src/textures/`) — mipmaps generated in compute; native texture arrays and cubemaps.
 - **Post** (`src/post/`) — a fullscreen-pass helper and reusable bright/blur/composite effects (bloom + ACES tonemap).
 - **Picking** (`src/picking/`) — GPU raycasting against object bounds, sharing the same world-matrix and bounds buffers the culling pass uses, so picking always agrees with what's rendered.
-- **Engine** (`src/engine/`) — the assembly layer that wires the above into one GPU-driven forward renderer.
+- **Engine** (`src/engine/`) — the assembly layer that wires the above into one GPU-driven forward renderer. Clustered lighting, shadows, and bloom are opt-in; it exposes `setSize()`/`dispose()`.
 
 ### The frame
 
@@ -197,13 +201,13 @@ Each frame, the Engine's render graph runs:
 
 ## Using the systems directly
 
-You don't have to use the Engine. Every system is independently constructable — see examples 01–15, each of which wires a subset by hand. The Engine is just the convenient default; when a project outgrows it, drop down a layer rather than fighting an abstraction.
+You don't have to use the Engine. Every system is independently constructable — see examples 01–15, each of which wires a subset by hand. The Engine is just the convenient default; when a project outgrows it, drop down a layer rather than fighting an abstraction. For a heterogeneous, game-like scene that doesn't fit the Engine's single-geometry batch, use the **retained scene layer** (`SceneRenderer` + `Mesh`/`Group`, examples 19–22) instead.
 
 ---
 
 ## Status and non-goals
 
-The engine implements its full intended pipeline: device layer, render graph, geometry, materials, scene graph with compute transforms, GPU culling, indirect rendering, clustered lighting, shadows, post-processing, textures, GPU-driven consolidation, picking, and the Engine assembly layer.
+The engine implements its full intended pipeline: device layer, render graph, math, geometry (primitives + arena), materials (with built-in factories), cameras (perspective + orthographic), scene graph with compute transforms, GPU culling (single + heterogeneous multi-draw), indirect rendering, clustered lighting, shadows, post-processing, textures, GPU-driven consolidation, picking, the Engine assembly layer, and a retained-mode scene layer (`SceneRenderer`) that draws an imperative `Mesh`/`Group` graph through the GPU-driven path.
 
 Explicitly out of scope for the core engine: physics, audio, input handling, a WebGL fallback, a Three.js compatibility layer, and a visual editor. Some may arrive as external modules. A glTF mesh loader and PBR materials are natural next additions on top of the current foundation.
 
