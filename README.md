@@ -22,7 +22,7 @@ The design goal is twofold: an experienced graphics programmer reading the sourc
 
 ## Requirements
 
-- A browser with WebGPU enabled (Chrome/Edge 113+, or any current Chromium). WebGPU must be available as `navigator.gpu`.
+- A browser with WebGPU enabled (Chrome/Edge 113+, or Firefox 141+). WebGPU must be available as `navigator.gpu`. The engine runs cross-browser: it uses the standard `indirect-first-instance` feature (Firefox + Chromium) for GPU-driven indirect draws, and only opts into Chromium's experimental multi-draw-indirect when present — falling back to a bounded indirect-draw loop (still GPU-decided visibility) elsewhere. The active path is logged at startup, e.g. `indirect-first-instance: on | multi-draw: off`.
 - No build step. The engine is plain ES modules, imported directly. A bundler is the consumer's choice, not the engine's.
 - ES modules require HTTP (not `file://`), so the demos must be served by a static web server.
 
@@ -50,7 +50,7 @@ The examples are numbered to mirror how the engine was built, each one self-cont
 | 05 | materials | Pipeline descriptors, hashing/caching, bind groups |
 | 06 | scene-graph | Hierarchy with CPU transform propagation |
 | 07 | compute-transforms | Transform propagation moved to a compute pass |
-| 08 | culling | GPU frustum + Hi-Z occlusion culling |
+| 08 | culling | GPU frustum + Hi-Z occlusion culling, with a live per-object visibility counter (visible / occluded / frustum-culled) |
 | 09 | indirect-draw | GPU-generated indirect draw arguments |
 | 10 | clustered-lighting | Clustered point lights via compute light assignment |
 | 11 | shadow-maps | A directional shadow map with PCF |
