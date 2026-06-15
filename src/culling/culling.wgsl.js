@@ -87,18 +87,21 @@ fn testOcclusion(corners: array<vec3f, 8>) -> bool {
   let screenMax = max(uvA, uvB) * camera.viewport.zw;
   let sizePixels = max(screenMax - screenMin, vec2f(1.0, 1.0));
 
-  // Cap the mip level at a small fixed value (texel size <= 4px) rather
-  // than scaling it with the object's screen size. A mip level chosen from
-  // the object's footprint can produce texels much larger than the
-  // occluder's silhouette detail (e.g. a wall's edge) — at that coarse
-  // resolution a texel can read as "fully occluded" even though a thin
-  // sliver of the object is actually visible past the edge.
+  // Pick the Hi-Z mip where the object's footprint spans ~2 texels per axis, the
+  // standard Hi-Z choice: at this resolution the covered-texel rect is at most
+  // 2x2, so the loop below reads ~4 texels (cheap and bounded). A COARSER mip
+  // (e.g. a fixed 4px cap) is what made partially-occluded objects wrongly cull:
+  // when a thin visible sliver pokes past the wall edge, a too-coarse texel grid
+  // can miss the background texel entirely, so the reduction never sees the
+  // shallow (visible) depth and the object reads as fully hidden. Choosing the
+  // mip from the footprint keeps the visible sliver in its own texel.
   let hiZSize = vec2f(textureDimensions(hiZTexture, 0));
-  let mipLevel = i32(clamp(ceil(log2(max(sizePixels.x, sizePixels.y) * 0.5)), 0.0, min(2.0, f32(textureNumLevels(hiZTexture) - 1))));
+  let maxLevel = f32(textureNumLevels(hiZTexture) - 1);
+  let mipLevel = i32(clamp(ceil(log2(max(sizePixels.x, sizePixels.y) * 0.5)), 0.0, maxLevel));
 
   let mipSize = vec2f(textureDimensions(hiZTexture, mipLevel));
-  let coordA = vec2i(clamp(screenMin / hiZSize * mipSize, vec2f(0.0), mipSize - vec2f(1.0)));
-  let coordB = vec2i(clamp(screenMax / hiZSize * mipSize, vec2f(0.0), mipSize - vec2f(1.0)));
+  let coordA = vec2i(clamp(floor(screenMin / hiZSize * mipSize), vec2f(0.0), mipSize - vec2f(1.0)));
+  let coordB = vec2i(clamp(floor(screenMax / hiZSize * mipSize), vec2f(0.0), mipSize - vec2f(1.0)));
   let minCoord = min(coordA, coordB);
   let maxCoord = max(coordA, coordB);
 
@@ -107,28 +110,29 @@ fn testOcclusion(corners: array<vec3f, 8>) -> bool {
   let nearestDepth = ndcMin.z;
 
   // Each Hi-Z texel stores the FARTHEST (max) depth of geometry drawn into it.
-  // The object is hidden only if its nearest point is behind the occluder in
-  // EVERY covered texel — so take the MIN of the per-texel max-depths as the
-  // shallowest occluder across the footprint. If even one covered texel is
-  // shallow (e.g. the object pokes past a wall's edge into open background at
-  // depth 1.0), the object stays visible. Taking max here instead would make
-  // the test always pass (a texel containing the object's own prior-frame depth
-  // makes max >= the object's depth), so occlusion would never fire.
-  var occluderDepth = 1.0;
+  // The object is FULLY hidden only if its nearest point is behind the farthest
+  // occluder in EVERY covered texel — i.e. nearest > T_k for all k, which is
+  // nearest > max_k(T_k). So reduce with MAX and keep the object visible when
+  // nearest <= that max. This is what makes PARTIAL occlusion correct: a texel
+  // covering the visible sliver past a wall edge holds background depth (~1.0),
+  // so the max is ~1.0 >= nearest and the object stays visible. (Reducing with
+  // min instead takes the shallowest occluder — the wall — so any object whose
+  // footprint overlaps the wall at all reads as hidden, wrongly culling slivers.)
+  var farthestOccluder = 0.0;
   for (var y = minCoord.y; y <= maxCoord.y; y++) {
     for (var x = minCoord.x; x <= maxCoord.x; x++) {
-      occluderDepth = min(occluderDepth, textureLoad(hiZTexture, vec2i(x, y), mipLevel).r);
+      farthestOccluder = max(farthestOccluder, textureLoad(hiZTexture, vec2i(x, y), mipLevel).r);
     }
   }
 
-  // Visible if the object's nearest point is in front of (or at) the shallowest
-  // occluder depth, with a tiny bias for depth-precision aliasing. The bias
-  // must stay well below the depth separation between distinct occluders/occludees
-  // — with a perspective projection most depth precision sits near the camera, so
-  // far-apart objects can differ by only a few thousandths in NDC z. A bias as
-  // large as 0.01 there would swamp the separation and disable occlusion entirely.
+  // Visible if the object's nearest point is in front of (or at) the farthest
+  // occluder across its footprint, with a tiny bias for depth-precision aliasing.
+  // The bias must stay well below the depth separation between distinct
+  // occluders/occludees — under perspective most depth precision sits near the
+  // camera, so far-apart objects can differ by only a few thousandths in NDC z;
+  // a bias as large as 0.01 there would swamp the separation.
   const OCCLUSION_BIAS: f32 = 0.00005;
-  return nearestDepth <= occluderDepth + OCCLUSION_BIAS;
+  return nearestDepth <= farthestOccluder + OCCLUSION_BIAS;
 }
 
 @compute @workgroup_size(64)
