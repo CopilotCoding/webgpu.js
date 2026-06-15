@@ -141,10 +141,13 @@ export class SceneRenderer {
 
     // Sync the scene → GPU buffers ONCE per frame (not per camera). A frame is
     // identified by opts.frame; if two render() calls share it (main + minimap),
-    // the second reuses the already-synced state. If no frame id is given, every
-    // call syncs (safe default).
-    const frame = opts.frame;
-    const alreadySynced = frame !== undefined && frame === this._syncedFrame;
+    // the second reuses the already-synced state. If no frame id is given, mint a
+    // fresh monotonic id each call so every call re-syncs — and, crucially, so
+    // the per-frame guards downstream (e.g. shader-material uniform upload at
+    // `r._uFrame !== this._syncedFrame`) actually advance. (A plain `undefined`
+    // here would equal the initial `_uFrame`, silently skipping those uploads.)
+    const frame = opts.frame !== undefined ? opts.frame : (this._autoFrame = (this._autoFrame ?? 0) + 1);
+    const alreadySynced = frame === this._syncedFrame;
     let shaderMeshes = this._shaderMeshes;
     let pointsMeshes = this._pointsMeshes;
 
