@@ -47,11 +47,15 @@ export class CullingPass {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
+    // cullParams: vec2u = (objectCount, occlusionEnabled). Occlusion culling is
+    // OFF by default — see the shader header for why (single-frame-lagged Hi-Z
+    // can flicker objects at depth boundaries).
+    this.occlusionEnabled = false;
     this.objectCountBuffer = device.resources.createBuffer({
-      size: 4,
+      size: 8,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    device.queue.writeBuffer(this.objectCountBuffer.gpuBuffer, 0, new Uint32Array([this.objectCount]));
+    device.queue.writeBuffer(this.objectCountBuffer.gpuBuffer, 0, new Uint32Array([this.objectCount, 0]));
 
     const shaderModule = device.device.createShaderModule({ code: cullingShader });
     this.pipeline = device.device.createComputePipeline({
@@ -104,7 +108,20 @@ export class CullingPass {
    */
   setObjectCount(count) {
     this.objectCount = count;
-    this.device.queue.writeBuffer(this.objectCountBuffer.gpuBuffer, 0, new Uint32Array([count]));
+    this.device.queue.writeBuffer(this.objectCountBuffer.gpuBuffer, 0, new Uint32Array([count, this.occlusionEnabled ? 1 : 0]));
+  }
+
+  /**
+   * Enables/disables Hi-Z occlusion culling. OFF by default: the indirect-draw
+   * path drops any object that fails occlusion against the previous frame's
+   * Hi-Z, which flickers objects at depth boundaries under a moving camera.
+   * Enable only where the draw path tolerates that (e.g. example 08, which uses
+   * the visibility bits for coloring, not for dropping geometry) or once
+   * two-phase occlusion culling is in place.
+   */
+  setOcclusionEnabled(enabled) {
+    this.occlusionEnabled = !!enabled;
+    this.device.queue.writeBuffer(this.objectCountBuffer.gpuBuffer, 0, new Uint32Array([this.objectCount, this.occlusionEnabled ? 1 : 0]));
   }
 
   cull(encoder) {

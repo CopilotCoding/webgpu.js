@@ -11,12 +11,16 @@ struct ObjectBounds {
   localMax: vec3f,
 };
 
+// cullParams.x = object count, cullParams.y = occlusionEnabled (0/1). Occlusion
+// culling against a single-frame-lagged Hi-Z can wrongly drop objects at depth
+// boundaries (causing flicker), so it is OFF by default — only enable it where
+// the draw path tolerates a frame of latency or implements two-phase culling.
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var<storage, read> worldMatrices: array<mat4x4f>;
 @group(0) @binding(2) var<storage, read> objectBounds: array<ObjectBounds>;
 @group(0) @binding(3) var<storage, read_write> visibility: array<u32>;
 @group(0) @binding(4) var hiZTexture: texture_2d<f32>;
-@group(0) @binding(5) var<uniform> objectCount: u32;
+@group(0) @binding(5) var<uniform> cullParams: vec2u;
 
 const VISIBLE_FRUSTUM: u32 = 1u;
 const VISIBLE_OCCLUSION: u32 = 2u;
@@ -128,7 +132,7 @@ fn testOcclusion(corners: array<vec3f, 8>) -> bool {
 
 @compute @workgroup_size(64)
 fn cull(@builtin(global_invocation_id) id: vec3u) {
-  if (id.x >= objectCount) {
+  if (id.x >= cullParams.x) {
     return;
   }
 
@@ -139,7 +143,10 @@ fn cull(@builtin(global_invocation_id) id: vec3u) {
   var result = 0u;
   if (testFrustum(corners)) {
     result |= VISIBLE_FRUSTUM;
-    if (testOcclusion(corners)) {
+    // VISIBLE_OCCLUSION gates drawing in indirectDraw.wgsl. When occlusion is
+    // disabled, set it for every frustum-visible object so nothing is dropped;
+    // otherwise set it only when the Hi-Z test says the object isn't hidden.
+    if (cullParams.y == 0u || testOcclusion(corners)) {
       result |= VISIBLE_OCCLUSION;
     }
   }

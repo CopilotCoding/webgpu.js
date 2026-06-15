@@ -189,6 +189,9 @@ try {
   });
 
   const cullingPass = new CullingPass(device, camera, cubeWorldMatrices, cubeBoundsArray, hiZBuffer);
+  // This example visualizes occlusion (cube colors + counter) and does not drop
+  // geometry based on it, so enabling occlusion here is safe — no flicker.
+  cullingPass.setOcclusionEnabled(true);
 
   // Readback of the per-object visibility bitmask so we can show live counts.
   // visibility[i] bits: 1 = inside frustum, 2 = visible (passed occlusion).

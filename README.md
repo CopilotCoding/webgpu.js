@@ -37,34 +37,37 @@ npx serve .
 python -m http.server 3000
 ```
 
-Then visit, e.g., `http://localhost:3000/examples/16-engine/index.html`.
+Then visit any example below. The links assume you serve the repository **root**
+(the folder containing both `webgpu.js/` and `PlanetVoxel/`) on port 3000 — e.g.
+`http://localhost:3000/webgpu.js/examples/16-engine/index.html`. If you serve the
+`webgpu.js/` folder directly instead, drop the `/webgpu.js` segment from the URLs.
 
 The examples are numbered to mirror how the engine was built, each one self-contained and demonstrating one system on top of the previous:
 
 | # | Example | Demonstrates |
 |---|---------|--------------|
-| 01 | device-init | Device acquisition, resource manager, a cleared canvas |
-| 02 | render-graph | Passes with declared dependencies, automatic ordering |
-| 03 | geometry | Immutable vertex/index buffers and layouts |
-| 04 | forward-pass | A basic forward render pass |
-| 05 | materials | Pipeline descriptors, hashing/caching, bind groups |
-| 06 | scene-graph | Hierarchy with CPU transform propagation |
-| 07 | compute-transforms | Transform propagation moved to a compute pass |
-| 08 | culling | GPU frustum + Hi-Z occlusion culling, with a live per-object visibility counter (visible / occluded / frustum-culled) |
-| 09 | indirect-draw | GPU-generated indirect draw arguments |
-| 10 | clustered-lighting | Clustered point lights via compute light assignment |
-| 11 | shadow-maps | A directional shadow map with PCF |
-| 12 | post-processing | HDR, bloom, ACES tonemap as render-graph passes |
-| 13 | textures | Compute-generated mipmaps, texture arrays, anisotropy |
-| 14 | gpu-driven | The whole scene consolidated into one indirect draw |
-| 15 | picking | GPU raycasting against object bounds |
-| 16 | **engine** | The high-level Engine layer — the whole scene in ~55 lines |
-| 17 | primitives | Cylinder/cone/sphere/octahedron/dodecahedron/tube generators + computed normals |
-| 18 | materials-blend | Built-in Basic/Lambert/Points materials, additive + alpha blending, a custom-shader vertex-color mesh |
-| 19 | multi-geometry | GPU-driven rendering of *heterogeneous* geometry: a GeometryArena + compute-built indexed multi-draw |
-| 20 | ortho-and-layers | Orthographic camera + a layer mask evaluated in the GPU cull pass (a minimap inset) |
-| 21 | composable-frame | The Engine's frame as composable passes: bloom opt-in, plus `setSize()` / `dispose()` |
-| 22 | scene-layer | Retained-mode scene graph (Mesh/Group/lights/materials) drawn GPU-driven by SceneRenderer: Lambert + additive + custom-shader + points |
+| 01 | [device-init](http://localhost:3000/webgpu.js/examples/01-device-init/index.html) | Device acquisition, resource manager, a cleared canvas |
+| 02 | [render-graph](http://localhost:3000/webgpu.js/examples/02-render-graph/index.html) | Passes with declared dependencies, automatic ordering |
+| 03 | [geometry](http://localhost:3000/webgpu.js/examples/03-geometry/index.html) | Immutable vertex/index buffers and layouts |
+| 04 | [forward-pass](http://localhost:3000/webgpu.js/examples/04-forward-pass/index.html) | A basic forward render pass |
+| 05 | [materials](http://localhost:3000/webgpu.js/examples/05-materials/index.html) | Pipeline descriptors, hashing/caching, bind groups |
+| 06 | [scene-graph](http://localhost:3000/webgpu.js/examples/06-scene-graph/index.html) | Hierarchy with CPU transform propagation |
+| 07 | [compute-transforms](http://localhost:3000/webgpu.js/examples/07-compute-transforms/index.html) | Transform propagation moved to a compute pass |
+| 08 | [culling](http://localhost:3000/webgpu.js/examples/08-culling/index.html) | GPU frustum + Hi-Z occlusion culling, with a live per-object visibility counter (visible / occluded / frustum-culled) |
+| 09 | [indirect-draw](http://localhost:3000/webgpu.js/examples/09-indirect-draw/index.html) | GPU-generated indirect draw arguments |
+| 10 | [clustered-lighting](http://localhost:3000/webgpu.js/examples/10-clustered-lighting/index.html) | Clustered point lights via compute light assignment |
+| 11 | [shadow-maps](http://localhost:3000/webgpu.js/examples/11-shadow-maps/index.html) | A directional shadow map with PCF |
+| 12 | [post-processing](http://localhost:3000/webgpu.js/examples/12-post-processing/index.html) | HDR, bloom, ACES tonemap as render-graph passes |
+| 13 | [textures](http://localhost:3000/webgpu.js/examples/13-textures/index.html) | Compute-generated mipmaps, texture arrays, anisotropy |
+| 14 | [gpu-driven](http://localhost:3000/webgpu.js/examples/14-gpu-driven/index.html) | The whole scene consolidated into one indirect draw |
+| 15 | [picking](http://localhost:3000/webgpu.js/examples/15-picking/index.html) | GPU raycasting against object bounds |
+| 16 | [**engine**](http://localhost:3000/webgpu.js/examples/16-engine/index.html) | The high-level Engine layer — the whole scene in ~55 lines |
+| 17 | [primitives](http://localhost:3000/webgpu.js/examples/17-primitives/index.html) | Cylinder/cone/sphere/octahedron/dodecahedron/tube generators + computed normals |
+| 18 | [materials-blend](http://localhost:3000/webgpu.js/examples/18-materials-blend/index.html) | Built-in Basic/Lambert/Points materials, additive + alpha blending, a custom-shader vertex-color mesh |
+| 19 | [multi-geometry](http://localhost:3000/webgpu.js/examples/19-multi-geometry/index.html) | GPU-driven rendering of *heterogeneous* geometry: a GeometryArena + compute-built indexed multi-draw |
+| 20 | [ortho-and-layers](http://localhost:3000/webgpu.js/examples/20-ortho-and-layers/index.html) | Orthographic camera + a layer mask evaluated in the GPU cull pass (a minimap inset) |
+| 21 | [composable-frame](http://localhost:3000/webgpu.js/examples/21-composable-frame/index.html) | The Engine's frame as composable passes: bloom opt-in, plus `setSize()` / `dispose()` |
+| 22 | [scene-layer](http://localhost:3000/webgpu.js/examples/22-scene-layer/index.html) | Retained-mode scene graph (Mesh/Group/lights/materials) drawn GPU-driven by SceneRenderer: Lambert + additive + custom-shader + points |
 
 Start with **16-engine** to see the assembly layer, then read **01** through **15** to see what it's made of. Examples **17–22** add the capabilities needed to render a heterogeneous, game-like scene (many distinct meshes, custom shaders, transparency, an ortho minimap, a retained scene graph) while staying GPU-driven.
 
