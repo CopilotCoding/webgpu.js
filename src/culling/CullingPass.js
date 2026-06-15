@@ -47,15 +47,15 @@ export class CullingPass {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
-    // cullParams: vec2u = (objectCount, occlusionEnabled). Occlusion culling is
-    // OFF by default — see the shader header for why (single-frame-lagged Hi-Z
-    // can flicker objects at depth boundaries).
+    // cullParams (u32): low 31 bits = objectCount, top bit = occlusionEnabled.
+    // Occlusion culling is OFF by default — see the shader header for why
+    // (single-frame-lagged Hi-Z can flicker objects at depth boundaries).
     this.occlusionEnabled = false;
     this.objectCountBuffer = device.resources.createBuffer({
-      size: 8,
+      size: 4,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    device.queue.writeBuffer(this.objectCountBuffer.gpuBuffer, 0, new Uint32Array([this.objectCount, 0]));
+    device.queue.writeBuffer(this.objectCountBuffer.gpuBuffer, 0, new Uint32Array([this._packParams()]));
 
     const shaderModule = device.device.createShaderModule({ code: cullingShader });
     this.pipeline = device.device.createComputePipeline({
@@ -106,9 +106,15 @@ export class CullingPass {
    * Updates the live object count (must be <= the capacity the pass was
    * built with). Lets a scene grow/shrink without rebuilding the pass.
    */
+  // Packs (objectCount, occlusionEnabled) into one u32: low 31 bits count,
+  // top bit the occlusion flag. Keeps the cull uniform a 4-byte binding.
+  _packParams() {
+    return (this.objectCount & 0x7fffffff) | (this.occlusionEnabled ? 0x80000000 : 0);
+  }
+
   setObjectCount(count) {
     this.objectCount = count;
-    this.device.queue.writeBuffer(this.objectCountBuffer.gpuBuffer, 0, new Uint32Array([count, this.occlusionEnabled ? 1 : 0]));
+    this.device.queue.writeBuffer(this.objectCountBuffer.gpuBuffer, 0, new Uint32Array([this._packParams()]));
   }
 
   /**
@@ -121,7 +127,7 @@ export class CullingPass {
    */
   setOcclusionEnabled(enabled) {
     this.occlusionEnabled = !!enabled;
-    this.device.queue.writeBuffer(this.objectCountBuffer.gpuBuffer, 0, new Uint32Array([this.objectCount, this.occlusionEnabled ? 1 : 0]));
+    this.device.queue.writeBuffer(this.objectCountBuffer.gpuBuffer, 0, new Uint32Array([this._packParams()]));
   }
 
   cull(encoder) {

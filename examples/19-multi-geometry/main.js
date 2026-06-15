@@ -16,8 +16,9 @@ canvas.height = window.innerHeight;
 const showError = (m) => { errorEl.hidden = false; errorEl.textContent = m; };
 
 // Lit shader. The object id comes from the MultiDrawSystem's draw-slot group:
-// slotToObject[slotIndex], where slotIndex is a per-draw dynamic uniform. (We
-// avoid firstInstance, which is a no-op without indirect-first-instance.)
+// slotToObject[slotIndex], where slotIndex is a per-draw dynamic uniform. This
+// path works on every device (the firstInstance fast-path is only used under
+// Chromium multi-draw, where indirect firstInstance is honored).
 const shaderSource = /* wgsl */ `
 struct Camera { viewMatrix: mat4x4f, projectionMatrix: mat4x4f, frustumPlanes: array<vec4f,6>, viewport: vec4f, };
 struct Material { color: vec4f, };

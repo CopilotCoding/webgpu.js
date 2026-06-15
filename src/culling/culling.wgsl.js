@@ -11,16 +11,17 @@ struct ObjectBounds {
   localMax: vec3f,
 };
 
-// cullParams.x = object count, cullParams.y = occlusionEnabled (0/1). Occlusion
-// culling against a single-frame-lagged Hi-Z can wrongly drop objects at depth
-// boundaries (causing flicker), so it is OFF by default — only enable it where
-// the draw path tolerates a frame of latency or implements two-phase culling.
+// cullParams (u32): low 31 bits = object count; top bit (0x80000000) =
+// occlusionEnabled. Occlusion culling against a single-frame-lagged Hi-Z can
+// wrongly drop objects at depth boundaries (flicker), so it is OFF by default —
+// only enable it where the draw path tolerates a frame of latency or implements
+// two-phase culling. Packed into one u32 to keep this a 4-byte uniform binding.
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var<storage, read> worldMatrices: array<mat4x4f>;
 @group(0) @binding(2) var<storage, read> objectBounds: array<ObjectBounds>;
 @group(0) @binding(3) var<storage, read_write> visibility: array<u32>;
 @group(0) @binding(4) var hiZTexture: texture_2d<f32>;
-@group(0) @binding(5) var<uniform> cullParams: vec2u;
+@group(0) @binding(5) var<uniform> cullParams: u32;
 
 const VISIBLE_FRUSTUM: u32 = 1u;
 const VISIBLE_OCCLUSION: u32 = 2u;
@@ -132,7 +133,9 @@ fn testOcclusion(corners: array<vec3f, 8>) -> bool {
 
 @compute @workgroup_size(64)
 fn cull(@builtin(global_invocation_id) id: vec3u) {
-  if (id.x >= cullParams.x) {
+  let objectCount = cullParams & 0x7fffffffu;
+  let occlusionEnabled = (cullParams & 0x80000000u) != 0u;
+  if (id.x >= objectCount) {
     return;
   }
 
@@ -146,7 +149,7 @@ fn cull(@builtin(global_invocation_id) id: vec3u) {
     // VISIBLE_OCCLUSION gates drawing in indirectDraw.wgsl. When occlusion is
     // disabled, set it for every frustum-visible object so nothing is dropped;
     // otherwise set it only when the Hi-Z test says the object isn't hidden.
-    if (cullParams.y == 0u || testOcclusion(corners)) {
+    if (!occlusionEnabled || testOcclusion(corners)) {
       result |= VISIBLE_OCCLUSION;
     }
   }

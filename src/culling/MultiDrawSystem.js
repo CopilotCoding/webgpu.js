@@ -38,15 +38,18 @@ export class MultiDrawSystem {
     this.objectCount = 0;
     this.cameraLayerMask = 0xffffffff;
     // Draw-path capability:
-    //  - multiDraw: one multiDrawIndexedIndirect per batch (Chromium only).
-    //  - firstInstanceId: object id rides in firstInstance, read via
-    //    @builtin(instance_index) — available with EITHER multi-draw or the
-    //    standard indirect-first-instance feature (Firefox + Chrome). Lets the
-    //    loop drop its per-draw bind-group rebind.
-    // Only when neither is present do we fall back to the slotToObject loop.
+    //  - multiDraw: one multiDrawIndexedIndirect per batch (Chromium only). This
+    //    is the ONLY path where a non-zero firstInstance in the indirect args is
+    //    honored as @builtin(instance_index). A plain drawIndexedIndirect loop
+    //    does NOT pick up firstInstance even with the indirect-first-instance
+    //    feature enabled (observed on Firefox/wgpu — the feature gates non-zero
+    //    firstInstance for direct draws, not the per-call indirect args here).
+    //  - Otherwise we use the slotToObject draw-slot loop: each draw binds a
+    //    per-draw dynamic uniform (slotIndex) and the vertex shader reads
+    //    slotToObject[slotIndex]. Works on every device, no feature needed.
     const feats = device.device.features;
     this.multiDraw = feats.has('chromium-experimental-multi-draw-indirect');
-    this.firstInstanceId = this.multiDraw || feats.has('indirect-first-instance');
+    this.firstInstanceId = this.multiDraw;
 
     this.recordBuffer = opts.recordBuffer ?? device.resources.createBuffer({
       size: capacity * RECORD_SIZE,
