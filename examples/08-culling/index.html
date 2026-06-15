@@ -16,11 +16,17 @@
       font-family: monospace; color: #fff; background: rgba(0,0,0,0.5);
       padding: 0.5rem 1rem;
     }
+    #counts {
+      position: absolute; top: 0; left: 0;
+      font-family: monospace; color: #fff; background: rgba(0,0,0,0.6);
+      padding: 0.5rem 1rem; line-height: 1.5; white-space: pre;
+    }
   </style>
 </head>
 <body>
   <canvas id="canvas"></canvas>
   <div id="error" hidden></div>
+  <div id="counts">…</div>
   <div id="legend">green = visible &nbsp; red = frustum-culled &nbsp; yellow = occlusion-culled</div>
   <script type="module" src="./main.js"></script>
 </body>

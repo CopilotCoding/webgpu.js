@@ -72,8 +72,14 @@ fn testOcclusion(corners: array<vec3f, 8>) -> bool {
     ndcMax = max(ndcMax, ndc);
   }
 
-  let screenMin = (ndcMin.xy * 0.5 + 0.5) * camera.viewport.zw;
-  let screenMax = (ndcMax.xy * 0.5 + 0.5) * camera.viewport.zw;
+  // Convert the NDC AABB rect to Hi-Z texel space. NDC +Y points UP, but the
+  // Hi-Z texture (copied straight from the depth attachment) has row 0 at the
+  // TOP, so the Y axis must be flipped — otherwise an object low on screen would
+  // sample Hi-Z texels from the top of the screen and read the wrong occluder.
+  let uvA = vec2f(ndcMin.x * 0.5 + 0.5, 0.5 - ndcMin.y * 0.5);
+  let uvB = vec2f(ndcMax.x * 0.5 + 0.5, 0.5 - ndcMax.y * 0.5);
+  let screenMin = min(uvA, uvB) * camera.viewport.zw;
+  let screenMax = max(uvA, uvB) * camera.viewport.zw;
   let sizePixels = max(screenMax - screenMin, vec2f(1.0, 1.0));
 
   // Cap the mip level at a small fixed value (texel size <= 4px) rather
@@ -95,27 +101,29 @@ fn testOcclusion(corners: array<vec3f, 8>) -> bool {
   // WebGPU's depth range is [0, 1] with 0 at the near plane).
   let nearestDepth = ndcMin.z;
 
-  // Sample every Hi-Z texel the AABB's screen rect overlaps (not just its
-  // center) and take the max stored depth across them. If any covered
-  // texel still shows background (depth 1.0) — i.e. the object's rect
-  // isn't fully covered by closer geometry — storedDepth ends up at 1.0
-  // and the object stays visible, instead of a single coarse center-texel
-  // sample marking a partially-occluded object as fully occluded.
-  var storedDepth = 0.0;
+  // Each Hi-Z texel stores the FARTHEST (max) depth of geometry drawn into it.
+  // The object is hidden only if its nearest point is behind the occluder in
+  // EVERY covered texel — so take the MIN of the per-texel max-depths as the
+  // shallowest occluder across the footprint. If even one covered texel is
+  // shallow (e.g. the object pokes past a wall's edge into open background at
+  // depth 1.0), the object stays visible. Taking max here instead would make
+  // the test always pass (a texel containing the object's own prior-frame depth
+  // makes max >= the object's depth), so occlusion would never fire.
+  var occluderDepth = 1.0;
   for (var y = minCoord.y; y <= maxCoord.y; y++) {
     for (var x = minCoord.x; x <= maxCoord.x; x++) {
-      storedDepth = max(storedDepth, textureLoad(hiZTexture, vec2i(x, y), mipLevel).r);
+      occluderDepth = min(occluderDepth, textureLoad(hiZTexture, vec2i(x, y), mipLevel).r);
     }
   }
 
-  // Visible if the object's nearest point is in front of (or at) the
-  // stored max depth for the covered region. A small bias accounts for
-  // depth-precision aliasing at far distances, where objects only a few
-  // world units apart map to nearly identical NDC z values — without it,
-  // an object that's only barely behind the occluder in screen space
-  // (but still partly visible) can be marked fully occluded.
-  const OCCLUSION_BIAS: f32 = 0.01;
-  return nearestDepth <= storedDepth + OCCLUSION_BIAS;
+  // Visible if the object's nearest point is in front of (or at) the shallowest
+  // occluder depth, with a tiny bias for depth-precision aliasing. The bias
+  // must stay well below the depth separation between distinct occluders/occludees
+  // — with a perspective projection most depth precision sits near the camera, so
+  // far-apart objects can differ by only a few thousandths in NDC z. A bias as
+  // large as 0.01 there would swamp the separation and disable occlusion entirely.
+  const OCCLUSION_BIAS: f32 = 0.00005;
+  return nearestDepth <= occluderDepth + OCCLUSION_BIAS;
 }
 
 @compute @workgroup_size(64)

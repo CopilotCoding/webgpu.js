@@ -130,8 +130,8 @@ try {
       position: {
         format: 'float32x3',
         data: new Float32Array([
-          -3, -3, 0, 3, -3, 0, 3, 3, 0,
-          -3, -3, 0, 3, 3, 0, -3, 3, 0,
+          -4.5, -4.5, 0, 4.5, -4.5, 0, 4.5, 4.5, 0,
+          -4.5, -4.5, 0, 4.5, 4.5, 0, -4.5, 4.5, 0,
         ]),
       },
     },
@@ -190,6 +190,15 @@ try {
 
   const cullingPass = new CullingPass(device, camera, cubeWorldMatrices, cubeBoundsArray, hiZBuffer);
 
+  // Readback of the per-object visibility bitmask so we can show live counts.
+  // visibility[i] bits: 1 = inside frustum, 2 = visible (passed occlusion).
+  const visStaging = device.resources.createBuffer({
+    size: cubeCount * 4,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+  const countsEl = document.getElementById('counts');
+  let readbackBusy = false;
+
   const cubePipelineLayout = device.device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
@@ -236,6 +245,9 @@ try {
         encoder.copyBufferToBuffer(propagation.worldBuffer.gpuBuffer, cubeWorldBufferOffset, cubeWorldMatrices.gpuBuffer, 0, cubeCount * 64);
         hiZBuffer.build(encoder, depthTexture);
         cullingPass.cull(encoder);
+        // Snapshot the visibility results for the CPU-side counter (only when a
+        // previous readback isn't still in flight — the buffer is unmapped then).
+        if (!readbackBusy) encoder.copyBufferToBuffer(cullingPass.visibilityBuffer.gpuBuffer, 0, visStaging.gpuBuffer, 0, cubeCount * 4);
       },
     });
 
@@ -271,6 +283,30 @@ try {
     });
 
     graph.execute();
+
+    // Async readback of the visibility snapshot → live counts. One in flight at
+    // a time; the result trails rendering by a frame or two (no GPU stall).
+    if (!readbackBusy) {
+      readbackBusy = true;
+      visStaging.gpuBuffer.mapAsync(GPUMapMode.READ).then(() => {
+        const bits = new Uint32Array(visStaging.gpuBuffer.getMappedRange());
+        let visible = 0, occluded = 0, frustum = 0;
+        for (let i = 0; i < cubeCount; i++) {
+          const v = bits[i];
+          if (v & 2) visible++;            // passed occlusion (drawn)
+          else if (v & 1) occluded++;      // in frustum but occlusion-culled
+          else frustum++;                  // outside frustum
+        }
+        visStaging.gpuBuffer.unmap();
+        countsEl.textContent =
+          `total      ${cubeCount}\n` +
+          `visible    ${visible}\n` +
+          `occluded   ${occluded}\n` +
+          `frustum    ${frustum}\n` +
+          `culled     ${occluded + frustum}`;
+        readbackBusy = false;
+      }).catch(() => { readbackBusy = false; });
+    }
 
     requestAnimationFrame(frame);
   }
