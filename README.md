@@ -68,6 +68,7 @@ The examples are numbered to mirror how the engine was built, each one self-cont
 | 20 | [ortho-and-layers](http://localhost:3000/webgpu.js/examples/20-ortho-and-layers/index.html) | Orthographic camera + a layer mask evaluated in the GPU cull pass (a minimap inset) |
 | 21 | [composable-frame](http://localhost:3000/webgpu.js/examples/21-composable-frame/index.html) | The Engine's frame as composable passes: bloom opt-in, plus `setSize()` / `dispose()` |
 | 22 | [scene-layer](http://localhost:3000/webgpu.js/examples/22-scene-layer/index.html) | Retained-mode scene graph (Mesh/Group/lights/materials) drawn GPU-driven by SceneRenderer: Lambert + additive + custom-shader + points |
+| 23 | [occlusion-city](http://localhost:3000/webgpu.js/examples/23-occlusion-popping/index.html) | Hi-Z occlusion culling in a city scene: buildings hidden behind nearer ones are dropped from the indirect-draw path as the camera flies the streets ("buildings drawn" falls); [Space] toggles occlusion (off = frustum-only) |
 
 Start with **16-engine** to see the assembly layer, then read **01** through **15** to see what it's made of. Examples **17–22** add the capabilities needed to render a heterogeneous, game-like scene (many distinct meshes, custom shaders, transparency, an ortho minimap, a retained scene graph) while staying GPU-driven.
 

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>webgpu.js — Occlusion Culling (City)</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #error {
+      position: absolute; top: 0; left: 0; right: 0;
+      font-family: monospace; color: #fff; background: #b00020;
+      padding: 1rem; white-space: pre-wrap;
+    }
+    #panel {
+      position: absolute; top: 0; left: 0;
+      font-family: monospace; color: #fff; background: rgba(0,0,0,0.6);
+      padding: 0.6rem 1rem; line-height: 1.5; white-space: pre; font-size: 13px;
+    }
+    #help {
+      position: absolute; bottom: 0; left: 0; right: 0;
+      font-family: monospace; color: #fff; background: rgba(0,0,0,0.5);
+      padding: 0.5rem 1rem; font-size: 13px;
+    }
+    b { color: #ffd34d; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="error" hidden></div>
+  <div id="panel">…</div>
+  <div id="help">
+    <b>drag</b> rotate &nbsp; <b>wheel</b> zoom &nbsp; <b>right-drag</b> pan &nbsp;•&nbsp;
+    <b>[Space]</b> toggle occlusion culling<br />
+    A city drawn via the indirect-draw path, which DROPS geometry that fails occlusion
+    against the <i>previous</i> frame's Hi-Z. Fly down a street: buildings hidden behind
+    nearer ones aren't drawn — watch <b>buildings drawn</b> fall with occlusion ON. Under
+    fast motion a building at an occluder edge may pop for a frame (the 1-frame Hi-Z lag),
+    which is why occlusion ships OFF by default for the draw path.
+  </div>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
