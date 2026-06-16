@@ -1,10 +1,17 @@
 import { RenderGraph, CANVAS } from '../render-graph/RenderGraph.js';
 import { GeometryArena, interleaveStandard } from '../geometry/GeometryArena.js';
 import { MultiDrawSystem } from '../culling/MultiDrawSystem.js';
-import { lambertShader, basicShader, pointsShader } from './sceneShaders.wgsl.js';
+import { ShadowMap } from '../lighting/ShadowMap.js';
+import { Camera } from '../camera/Camera.js';
+import { identity } from '../math/mat4.js';
+import { lambertShader, basicShader, pointsShader, shadowDepthShader } from './sceneShaders.wgsl.js';
 
 const OBJ_CAP = 2048;          // per-batch object capacity
 const MATERIAL_STRIDE = 16;    // vec4 color (rgb + opacity)
+// Max simultaneous lights in the forward lights block. MUST match the
+// `array<Light, N>` size in sceneShaders.wgsl.js. Each light is 32 bytes; the
+// lambert shader loops over `count` of them per fragment.
+const MAX_LIGHTS = 8;
 
 // Byte size per GPUVertexFormat, for building custom-shader vertex layouts.
 const VERTEX_FORMAT_BYTES = {
@@ -38,8 +45,25 @@ export class SceneRenderer {
     this._buildSizedTargets();
 
     // Shared scene uniforms.
-    this.lightsBuffer = device.resources.createBuffer({ size: 16 + 4 * 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.lightsBuffer = device.resources.createBuffer({ size: 16 + MAX_LIGHTS * 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.fogBuffer = device.resources.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+    // --- Optional shadow map (off until enableShadows() is called) ---
+    // Bindings 3-5 of the scene group are ALWAYS present so the layout never
+    // changes; when shadows are off they point at a 1x1 dummy depth texture and
+    // a disabled uniform (shadowParams enabled=0), and shaders that don't include
+    // the shadow path simply never sample them. This keeps existing pipelines and
+    // examples 19-22 byte-for-byte compatible.
+    this.shadowMap = null;            // ShadowMap instance when enabled
+    this.shadowEnabled = false;
+    // shadowParams uniform: lightViewProj (mat4) + lightDir.xyz + enabled (vec4).
+    this.shadowParamsBuffer = device.resources.createBuffer({ size: 64 + 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(this.shadowParamsBuffer.gpuBuffer, 0, new Float32Array(20)); // all zero => enabled=0
+    this._dummyShadowTex = device.resources.createTexture({
+      size: [1, 1], format: 'depth32float',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.shadowSampler = device.resources.createSampler({ compare: 'less', magFilter: 'linear', minFilter: 'linear' });
 
     // Bind group layouts shared by the lambert/basic batch pipelines.
     this.sceneBGL = device.device.createBindGroupLayout({
@@ -47,6 +71,9 @@ export class SceneRenderer {
         { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 3, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },     // shadowParams
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth', viewDimension: '2d' } },   // shadow map
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'comparison' } },                          // shadow comparison sampler
       ],
     });
     this.objectBGL = device.device.createBindGroupLayout({
@@ -89,6 +116,60 @@ export class SceneRenderer {
     this.depthTexture.destroy();
     if (this.msaaColor) this.msaaColor.destroy();
     this._buildSizedTargets();
+  }
+
+  // --- Optional directional-sun shadows ---
+  //
+  // Off by default; apps that want their own shadow scheme just never call this.
+  // `bounds` is the world-space AABB the shadow map covers (for a planet, a box
+  // enclosing it, e.g. { min:[-200,-200,-200], max:[200,200,200] }). Casters are
+  // every shadow-batched mesh; a material/mesh opts out with castShadow:false.
+  // Receivers are lambert batches and any ShaderMaterial with receiveShadow:true
+  // (e.g. the terrain shader), which sample group(0) bindings 3-5 / its own
+  // shadow group.
+  enableShadows({ size = 2048, bounds, direction = [0.4, -0.7, 0.35] } = {}) {
+    if (!this.shadowMap) this.shadowMap = new ShadowMap(this.device, { mapSize: size });
+    this.shadowEnabled = true;
+    this.shadowBounds = bounds || { min: [-200, -200, -200], max: [200, 200, 200] };
+    this.shadowDirection = direction;
+    // A pseudo-camera whose frustum is the light's, so each batch's
+    // MultiDrawSystem can cull casters against the shadow volume and the depth
+    // pass draws them. projection = lightViewProj, view = identity.
+    if (!this._lightCamera) this._lightCamera = new Camera(this.device);
+    this._refreshShadow();
+    // Existing per-camera scene bind groups reference the dummy shadow view —
+    // drop them so they rebuild against the real shadow map.
+    for (const batch of this._batches.values()) batch._perCamera.clear();
+  }
+
+  disableShadows() {
+    this.shadowEnabled = false;
+    this.device.queue.writeBuffer(this.shadowParamsBuffer.gpuBuffer, 0, new Float32Array(20)); // enabled=0
+    for (const batch of this._batches.values()) batch._perCamera.clear();
+  }
+
+  /** Sets the sun's travel direction (world space) for the shadow map. */
+  setShadowLight(direction) {
+    this.shadowDirection = direction;
+    if (this.shadowEnabled) this._refreshShadow();
+  }
+
+  // Rebuilds the light-space matrix from the current direction + bounds and
+  // mirrors it into shadowParamsBuffer (lightViewProj + dir + enabled=1).
+  _refreshShadow() {
+    this.shadowMap.update(this.shadowDirection, this.shadowBounds);
+    const data = new Float32Array(20);
+    data.set(this.shadowMap.viewProjectionMatrix, 0);
+    const d = this.shadowDirection;
+    const len = Math.hypot(d[0], d[1], d[2]) || 1;
+    data[16] = d[0] / len; data[17] = d[1] / len; data[18] = d[2] / len;
+    data[19] = 1; // enabled
+    this.device.queue.writeBuffer(this.shadowParamsBuffer.gpuBuffer, 0, data);
+    // Drive the light camera's frustum from the shadow matrix (proj = lightVP,
+    // view = identity) so batches cull casters against the shadow volume.
+    this._lightCamera.setProjectionMatrix(this.shadowMap.viewProjectionMatrix);
+    this._lightCamera.setViewMatrix(identity());
+    this._lightCamera.update();
   }
 
   // --- batch management ---
@@ -202,6 +283,48 @@ export class SceneRenderer {
       });
     }
 
+    // --- Shadow pass (optional): cull casters for the light camera, then render
+    // their depth into the shadow map. Only the FIRST render() of a frame needs
+    // it (the shadow map is shared across cameras), so skip when this camera
+    // shares an already-synced frame's shadow build.
+    if (this.shadowEnabled && this._shadowBuiltFrame !== frame) {
+      this._shadowBuiltFrame = frame;
+      const lc = this._lightCamera;
+      const shadowBatches = [];
+      for (const batch of this._batches.values()) {
+        if (batch.count === 0 || batch._sampleMaterial.castShadow === false) continue;
+        batch.cullFor(lc, 0xffffffff);
+        shadowBatches.push(batch);
+      }
+      for (const batch of shadowBatches) {
+        const pc = batch._perCamera.get(lc);
+        graph.addPass({
+          name: `shadow-cull-${batch.key}`,
+          writes: [pc.multi.drawArgsBuffer, pc.multi.drawCountBuffer, pc.multi.slotToObjectBuffer],
+          reads: [lc.buffer, batch.worldBuffer, batch.boundsBuffer, pc.multi.recordBuffer],
+          execute: (encoder) => pc.multi.build(encoder),
+        });
+      }
+      const shadowReads = [lc.buffer, this.shadowParamsBuffer];
+      for (const batch of shadowBatches) {
+        const pc = batch._perCamera.get(lc);
+        shadowReads.push(pc.multi.drawArgsBuffer, pc.multi.slotToObjectBuffer, batch.worldBuffer);
+      }
+      // Merge batches (terrain) cast too — their vertices are world-space, drawn
+      // straight from their pages in the depth pass.
+      const mergeCasters = [...this._mergeBatches.values()].filter(mb => mb.material.castShadow !== false);
+      graph.addPass({
+        name: 'shadow-depth',
+        depthStencilAttachment: { target: this.shadowMap.depthTexture, view: this.shadowMap.getView(), depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' },
+        writes: [this.shadowMap.depthTexture],
+        reads: shadowReads,
+        execute: (rp) => {
+          for (const batch of shadowBatches) batch.drawShadow(rp, lc);
+          for (const mb of mergeCasters) mb.drawShadow(rp);
+        },
+      });
+    }
+
     // Single forward pass: shader-meshes, opaque batches, transparent batches, points.
     const msaa = this.sampleCount > 1;
     const colorAttachment = msaa
@@ -258,14 +381,14 @@ export class SceneRenderer {
   }
 
   _uploadLights(scene) {
-    const data = new Float32Array(4 + 4 * 8);
+    const data = new Float32Array(4 + MAX_LIGHTS * 8);
     let count = 0;
     let ambR = 0, ambG = 0, ambB = 0;
     const lights = [];
     scene.traverse((n) => {
       if (n.isAmbient) { ambR += n.color.r * n.intensity; ambG += n.color.g * n.intensity; ambB += n.color.b * n.intensity; }
-      else if (n.isPointLight && lights.length < 4) lights.push({ point: true, n });
-      else if (n.isDirectional && lights.length < 4) lights.push({ point: false, n });
+      else if (n.isPointLight && lights.length < MAX_LIGHTS) lights.push({ point: true, n });
+      else if (n.isDirectional && lights.length < MAX_LIGHTS) lights.push({ point: false, n });
     });
     data[0] = ambR; data[1] = ambG; data[2] = ambB; data[3] = lights.length;
     lights.forEach((L, i) => {
@@ -490,8 +613,26 @@ class ShaderMergeBatch {
       return a;
     });
     const cull = m.side === 'double' ? 'none' : (m.side === 'back' ? 'front' : 'back');
+
+    // Optional shadow-receive group(2): shadowParams + shadow map + comparison
+    // sampler, when the renderer has shadows on AND this material opts in
+    // (material.receiveShadow). The material's WGSL must declare the matching
+    // group(2) bindings (see the game's terrain shader).
+    this._receivesShadow = this.renderer.shadowEnabled && m.receiveShadow === true;
+    const layouts = [this._cameraBGL, uBGL];
+    if (this._receivesShadow) {
+      this._shadowBGL = device.device.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth', viewDimension: '2d' } },
+          { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'comparison' } },
+        ],
+      });
+      layouts.push(this._shadowBGL);
+    }
+
     this.pipeline = device.device.createRenderPipeline({
-      layout: device.device.createPipelineLayout({ bindGroupLayouts: [this._cameraBGL, uBGL] }),
+      layout: device.device.createPipelineLayout({ bindGroupLayouts: layouts }),
       vertex: { module, entryPoint: 'vertexMain', buffers: [{ arrayStride: this.stride, attributes: attrs }] },
       fragment: { module, entryPoint: 'fragmentMain', targets: [{ format: this.renderer.format }] },
       primitive: { topology: m.topology, cullMode: m.topology === 'triangle-list' ? cull : 'none' },
@@ -502,6 +643,17 @@ class ShaderMergeBatch {
       this.uBuffer = device.resources.createBuffer({ size: m.uniformSize, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       this.uView = new Float32Array(m.uniformSize / 4);
       this.uBG = device.device.createBindGroup({ layout: uBGL, entries: [{ binding: 0, resource: { buffer: this.uBuffer.gpuBuffer } }] });
+    }
+    if (this._receivesShadow) {
+      const r = this.renderer;
+      this.shadowBG = device.device.createBindGroup({
+        layout: this._shadowBGL,
+        entries: [
+          { binding: 0, resource: { buffer: r.shadowParamsBuffer.gpuBuffer } },
+          { binding: 1, resource: r.shadowMap.getView() },
+          { binding: 2, resource: r.shadowSampler.gpuSampler },
+        ],
+      });
     }
   }
 
@@ -576,6 +728,52 @@ class ShaderMergeBatch {
     return spans;
   }
 
+  // Depth-only render of this merge batch's vertices into the sun shadow map.
+  // Terrain vertices are already world-space (identity model), so the shadow
+  // vertex shader is just lightViewProj * pos. Built lazily; skipped when the
+  // material opts out via castShadow:false.
+  _ensureShadowPipeline() {
+    if (this._shadowPipe !== undefined) return this._shadowPipe;
+    if (this.material.castShadow === false) { this._shadowPipe = null; return null; }
+    const device = this.device;
+    const code = /* wgsl */ `
+struct ShadowParams { lightViewProj: mat4x4f, lightDirEnabled: vec4f, };
+@group(0) @binding(0) var<uniform> shadow: ShadowParams;
+@vertex
+fn vertexMain(@location(0) p: vec3f) -> @builtin(position) vec4f {
+  return shadow.lightViewProj * vec4f(p, 1.0);
+}`;
+    const module = device.device.createShaderModule({ code });
+    const bgl = device.device.createBindGroupLayout({
+      entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } }],
+    });
+    this._shadowPipe = device.device.createRenderPipeline({
+      layout: device.device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+      // Only the position attribute matters; bind the full interleaved stride and
+      // read location 0 (position is always attribute 0 of the merge layout).
+      vertex: { module, entryPoint: 'vertexMain', buffers: [{ arrayStride: this.stride, attributes: [{ format: 'float32x3', offset: 0, shaderLocation: 0 }] }] },
+      primitive: { topology: 'triangle-list', cullMode: 'none' },
+      depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
+    });
+    this._shadowBG = device.device.createBindGroup({
+      layout: bgl, entries: [{ binding: 0, resource: { buffer: this.renderer.shadowParamsBuffer.gpuBuffer } }],
+    });
+    return this._shadowPipe;
+  }
+
+  drawShadow(rp) {
+    if (this._slots.size === 0) return;
+    if (!this._ensureShadowPipeline()) return;
+    rp.setPipeline(this._shadowPipe);
+    rp.setBindGroup(0, this._shadowBG);
+    for (const page of this.pages) {
+      const spans = this._pageSpans(page);
+      if (spans.length === 0) continue;
+      rp.setVertexBuffer(0, page.buffer.gpuBuffer);
+      for (const s of spans) rp.draw(s.count, 1, s.offset);
+    }
+  }
+
   draw(rp, camera, syncedFrame) {
     this._ensurePipeline();
     if (this._slots.size === 0) return;
@@ -592,6 +790,7 @@ class ShaderMergeBatch {
     rp.setPipeline(this.pipeline);
     rp.setBindGroup(0, camBG);
     if (this.uBG) rp.setBindGroup(1, this.uBG);
+    if (this.shadowBG) rp.setBindGroup(2, this.shadowBG);
     for (const page of this.pages) {
       const spans = this._pageSpans(page);
       if (spans.length === 0) continue;
@@ -658,17 +857,76 @@ class Batch {
       });
     }
 
+    const r = this.renderer;
+    const shadowView = (r.shadowEnabled && r.shadowMap)
+      ? r.shadowMap.getView()
+      : r._dummyShadowTex.gpuTexture.createView();
     const sceneBG = this.device.device.createBindGroup({
-      layout: this.renderer.sceneBGL,
+      layout: r.sceneBGL,
       entries: [
         { binding: 0, resource: { buffer: camera.buffer.gpuBuffer } },
-        { binding: 1, resource: { buffer: this.renderer.lightsBuffer.gpuBuffer } },
-        { binding: 2, resource: { buffer: this.renderer.fogBuffer.gpuBuffer } },
+        { binding: 1, resource: { buffer: r.lightsBuffer.gpuBuffer } },
+        { binding: 2, resource: { buffer: r.fogBuffer.gpuBuffer } },
+        { binding: 3, resource: { buffer: r.shadowParamsBuffer.gpuBuffer } },
+        { binding: 4, resource: shadowView },
+        { binding: 5, resource: r.shadowSampler.gpuSampler },
       ],
     });
     pc = { multi, sceneBG };
     this._perCamera.set(camera, pc);
     return pc;
+  }
+
+  // Lazily builds the depth-only pipeline used to render this batch's casters
+  // into the sun shadow map. group(0)=shadowParams, group(1)=worldMatrices,
+  // and (slot path only) group(2)=drawSlot. No fragment/color target.
+  _shadowPipeline() {
+    if (this._shadowPipe) return this._shadowPipe;
+    const device = this.device;
+    const byFirstInstance = this._multiForLayout.firstInstanceId;
+    const module = device.device.createShaderModule({ code: shadowDepthShader(byFirstInstance) });
+    // group(0) = shadowParams uniform; reuse a tiny dedicated layout.
+    if (!this.renderer._shadowDepthBGL) {
+      this.renderer._shadowDepthBGL = device.device.createBindGroupLayout({
+        entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } }],
+      });
+      this.renderer._shadowWorldBGL = device.device.createBindGroupLayout({
+        entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } }],
+      });
+    }
+    const layouts = byFirstInstance
+      ? [this.renderer._shadowDepthBGL, this.renderer._shadowWorldBGL]
+      : [this.renderer._shadowDepthBGL, this.renderer._shadowWorldBGL, this._multiForLayout.drawSlotBindGroupLayout];
+    this._shadowPipe = device.device.createRenderPipeline({
+      layout: device.device.createPipelineLayout({ bindGroupLayouts: layouts }),
+      vertex: { module, entryPoint: 'vertexMain', buffers: this.arena.vertexBufferLayouts },
+      primitive: { topology: 'triangle-list', cullMode: 'none' },
+      depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
+    });
+    this._shadowParamsBG = device.device.createBindGroup({
+      layout: this.renderer._shadowDepthBGL,
+      entries: [{ binding: 0, resource: { buffer: this.renderer.shadowParamsBuffer.gpuBuffer } }],
+    });
+    this._shadowWorldBG = device.device.createBindGroup({
+      layout: this.renderer._shadowWorldBGL,
+      entries: [{ binding: 0, resource: { buffer: this.worldBuffer.gpuBuffer } }],
+    });
+    return this._shadowPipe;
+  }
+
+  // Records this batch's casters into the active shadow (depth) render pass,
+  // using `camera`'s already-built cull/draw args (the light camera).
+  drawShadow(rp, camera) {
+    if (this.count === 0) return;
+    if (this._sampleMaterial.castShadow === false) return;
+    const pc = this._perCamera.get(camera);
+    if (!pc) return;
+    this._shadowPipeline();
+    rp.setPipeline(this._shadowPipe);
+    rp.setBindGroup(0, this._shadowParamsBG);
+    rp.setBindGroup(1, this._shadowWorldBG);
+    this.arena.bind(rp);
+    pc.multi.drawAll(rp, 2);
   }
 
   _buildPipeline() {

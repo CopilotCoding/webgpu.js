@@ -10,12 +10,16 @@ import { Color } from './Color.js';
 // 'blending': 'normal' | 'additive'
 
 export class LambertMaterial {
-  constructor({ color = 0xffffff, fog = true } = {}) {
+  constructor({ color = 0xffffff, fog = true, castShadow = true, receiveShadow = true } = {}) {
     this.kind = 'lambert';
     this.color = color instanceof Color ? color : new Color(color);
     this.fog = fog;
     this.transparent = false;
     this.opacity = 1;
+    // Lambert receives sun shadows by default (the shader always samples
+    // sunShadow, which returns 1.0 when shadows are off).
+    this.castShadow = castShadow;
+    this.receiveShadow = receiveShadow;
   }
 }
 
@@ -23,7 +27,7 @@ export class BasicMaterial {
   constructor({
     color = 0xffffff, opacity = 1, transparent = false,
     blending = 'normal', depthWrite = true, depthTest = true,
-    side = 'front', wireframe = false, fog = true,
+    side = 'front', wireframe = false, fog = true, castShadow = true,
   } = {}) {
     this.kind = 'basic';
     this.color = color instanceof Color ? color : new Color(color);
@@ -35,6 +39,9 @@ export class BasicMaterial {
     this.side = side;
     this.wireframe = wireframe;
     this.fog = fog;
+    // Unlit; doesn't receive shadows. Casting defaults on but transparent/glow
+    // materials (sun, atmosphere) should pass castShadow:false.
+    this.castShadow = castShadow;
   }
 }
 
@@ -78,6 +85,8 @@ export class ShaderMaterial {
     depthCompare = 'less',
     topology = 'triangle-list',
     merge = false,
+    castShadow = true,
+    receiveShadow = false,
   }) {
     this.kind = 'shader';
     this.wgsl = wgsl;
@@ -89,6 +98,11 @@ export class ShaderMaterial {
     this.depthWrite = depthWrite;
     this.depthCompare = depthCompare;
     this.topology = topology;
+    // Shadow participation (used when SceneRenderer.enableShadows() is active).
+    // castShadow: rendered into the sun shadow map. receiveShadow: the shader
+    // declares the group(2) shadow bindings and samples sunShadow().
+    this.castShadow = castShadow;
+    this.receiveShadow = receiveShadow;
     // merge: every mesh sharing this material has an IDENTITY transform (its
     // vertices are already world-space) and reads only this material's shared
     // uniform — so the renderer packs all of them into one geometry stream and
